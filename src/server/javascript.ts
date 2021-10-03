@@ -43,7 +43,8 @@ export type FuncOn<On, Arg2, R> = string | ((on: On, arg2: Unboxed<Arg2>) => R |
 export type SmartHandle<T> = T extends Node ? dom.ElementHandle<T> : JSHandle<T>;
 
 export interface ExecutionContextDelegate {
-  rawEvaluate(expression: string): Promise<ObjectId>;
+  rawEvaluateJSON(expression: string): Promise<any>;
+  rawEvaluateHandle(expression: string): Promise<ObjectId>;
   rawCallFunctionNoReply(func: Function, ...args: any[]): void;
   evaluateWithArguments(expression: string, returnByValue: boolean, utilityScript: JSHandle<any>, values: any[], objectIds: ObjectId[]): Promise<any>;
   getProperties(context: ExecutionContext, objectId: ObjectId): Promise<Map<string, JSHandle>>;
@@ -56,7 +57,7 @@ export class ExecutionContext extends SdkObject {
   private _utilityScriptPromise: Promise<JSHandle> | undefined;
 
   constructor(parent: SdkObject, delegate: ExecutionContextDelegate) {
-    super(parent);
+    super(parent, 'execution-context');
     this._delegate = delegate;
   }
 
@@ -75,7 +76,7 @@ export class ExecutionContext extends SdkObject {
         ${utilityScriptSource.source}
         return new pwExport();
       })();`;
-      this._utilityScriptPromise = this._delegate.rawEvaluate(source).then(objectId => new JSHandle(this, 'object', objectId));
+      this._utilityScriptPromise = this._delegate.rawEvaluateHandle(source).then(objectId => new JSHandle(this, 'object', undefined, objectId));
     }
     return this._utilityScriptPromise;
   }
@@ -84,13 +85,12 @@ export class ExecutionContext extends SdkObject {
     return this._delegate.createHandle(this, remoteObject);
   }
 
-  async rawEvaluate(expression: string): Promise<void> {
-    // Make sure to never return a value.
-    await this._delegate.rawEvaluate(expression + '; 0');
+  async rawEvaluateJSON(expression: string): Promise<any> {
+    return await this._delegate.rawEvaluateJSON(expression);
   }
 
   async doSlowMo() {
-    // overrided in FrameExecutionContext
+    // overridden in FrameExecutionContext
   }
 }
 
@@ -103,15 +103,13 @@ export class JSHandle<T = any> extends SdkObject {
   protected _preview: string;
   private _previewCallback: ((preview: string) => void) | undefined;
 
-  constructor(context: ExecutionContext, type: string, objectId?: ObjectId, value?: any) {
-    super(context);
+  constructor(context: ExecutionContext, type: string, preview: string | undefined, objectId?: ObjectId, value?: any) {
+    super(context, 'handle');
     this._context = context;
     this._objectId = objectId;
     this._value = value;
     this._objectType = type;
-    if (this._objectId)
-      this._value = 'JSHandle@' + this._objectType;
-    this._preview = 'JSHandle@' + String(this._objectId ? this._objectType : this._value);
+    this._preview = this._objectId ? preview || `JSHandle@${this._objectType}` : String(value);
   }
 
   callFunctionNoReply(func: Function, arg: any) {
@@ -134,7 +132,7 @@ export class JSHandle<T = any> extends SdkObject {
 
   async getProperty(propertyName: string): Promise<JSHandle> {
     const objectHandle = await this.evaluateHandle((object: any, propertyName) => {
-      const result: any = {__proto__: null};
+      const result: any = { __proto__: null };
       result[propertyName] = object[propertyName];
       return result;
     }, propertyName);
@@ -174,12 +172,16 @@ export class JSHandle<T = any> extends SdkObject {
       this._context._delegate.releaseHandle(this._objectId).catch(e => {});
   }
 
-  toString(): string {
+  override toString(): string {
     return this._preview;
   }
 
   _setPreviewCallback(callback: (preview: string) => void) {
     this._previewCallback = callback;
+  }
+
+  preview(): string {
+    return this._preview;
   }
 
   _setPreview(preview: string) {
@@ -276,4 +278,12 @@ export function normalizeEvaluationExpression(expression: string, isFunction: bo
   if (/^(async)?\s*function(\s|\()/.test(expression))
     expression = '(' + expression + ')';
   return expression;
+}
+
+// Error inside the expression evaluation as opposed to a protocol error.
+export class JavaScriptErrorInEvaluate extends Error {
+}
+
+export function isJavaScriptErrorInEvaluate(error: Error) {
+  return error instanceof JavaScriptErrorInEvaluate;
 }

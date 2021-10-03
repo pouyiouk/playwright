@@ -15,25 +15,28 @@
  */
 
 import fs from 'fs';
-import * as util from 'util';
+import { assert } from '../utils/utils';
+import { ManualPromise } from '../utils/async';
+import { SdkObject } from './instrumentation';
 
 type SaveCallback = (localPath: string, error?: string) => Promise<void>;
+type CancelCallback = () => Promise<void>;
 
-export class Artifact {
+export class Artifact extends SdkObject {
   private _localPath: string;
   private _unaccessibleErrorMessage: string | undefined;
-  private _finishedCallback: () => void;
-  private _finishedPromise: Promise<void>;
+  private _cancelCallback: CancelCallback | undefined;
+  private _finishedPromise = new ManualPromise<void>();
   private _saveCallbacks: SaveCallback[] = [];
   private _finished: boolean = false;
   private _deleted = false;
   private _failureError: string | null = null;
 
-  constructor(localPath: string, unaccessibleErrorMessage?: string) {
+  constructor(parent: SdkObject, localPath: string, unaccessibleErrorMessage?: string, cancelCallback?: CancelCallback) {
+    super(parent, 'artifact');
     this._localPath = localPath;
     this._unaccessibleErrorMessage = unaccessibleErrorMessage;
-    this._finishedCallback = () => {};
-    this._finishedPromise = new Promise(f => this._finishedCallback = f);
+    this._cancelCallback = cancelCallback;
   }
 
   finishedPromise() {
@@ -75,6 +78,11 @@ export class Artifact {
     return this._failureError;
   }
 
+  async cancel(): Promise<void> {
+    assert(this._cancelCallback !== undefined);
+    return this._cancelCallback();
+  }
+
   async delete(): Promise<void> {
     if (this._unaccessibleErrorMessage)
       return;
@@ -83,7 +91,7 @@ export class Artifact {
       return;
     this._deleted = true;
     if (fileName)
-      await util.promisify(fs.unlink)(fileName).catch(e => {});
+      await fs.promises.unlink(fileName).catch(e => {});
   }
 
   async deleteOnContextClose(): Promise<void> {
@@ -93,7 +101,7 @@ export class Artifact {
       return;
     this._deleted = true;
     if (!this._unaccessibleErrorMessage)
-      await util.promisify(fs.unlink)(this._localPath).catch(e => {});
+      await fs.promises.unlink(this._localPath).catch(e => {});
     await this.reportFinished('File deleted upon browser context closure.');
   }
 
@@ -112,6 +120,6 @@ export class Artifact {
     }
     this._saveCallbacks = [];
 
-    this._finishedCallback();
+    this._finishedPromise.resolve();
   }
 }

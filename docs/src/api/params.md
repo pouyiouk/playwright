@@ -22,6 +22,12 @@ The default value can be changed by using the
 maximum time to wait for in milliseconds. Defaults to `30000` (30 seconds). Pass `0` to disable timeout. The default
 value can be changed by using the [`method: BrowserContext.setDefaultTimeout`].
 
+## input-strict
+- `strict` <[boolean]>
+
+When true, the call requires selector to resolve to a single element. If given selector resolves to more
+then one element, the call throws an exception.
+
 ## input-timeout
 - `timeout` <[float]>
 
@@ -44,7 +50,17 @@ Whether to bypass the [actionability](./actionability.md) checks. Defaults to `f
 ## input-selector
 - `selector` <[string]>
 
-A selector to search for element. If there are multiple elements satisfying the selector, the first will be used. See
+A selector to search for an element. If there are multiple elements satisfying the selector, the first will be used. See
+[working with selectors](./selectors.md) for more details.
+
+## input-source
+- `source` <[string]>
+A selector to search for an element to drag. If there are multiple elements satisfying the selector, the first will be used. See
+[working with selectors](./selectors.md) for more details.
+
+## input-target
+- `target` <[string]>
+A selector to search for an element to drop onto. If there are multiple elements satisfying the selector, the first will be used. See
 [working with selectors](./selectors.md) for more details.
 
 ## input-position
@@ -82,10 +98,41 @@ Time to wait between `mousedown` and `mouseup` in milliseconds. Defaults to 0.
 
 defaults to 1. See [UIEvent.detail].
 
+## input-trial
+- `trial` <[boolean]>
+
+When set, this method only performs the [actionability](./actionability.md) checks and skips the action. Defaults to `false`. Useful to wait until the element is ready for the action without performing it.
+
+## input-source-position
+- `sourcePosition` <[Object]>
+  - `x` <[float]>
+  - `y` <[float]>
+
+Clicks on the source element at this point relative to the top-left corner of the element's padding box. If not specified, some visible point of the element is used.
+
+## input-target-position
+- `targetPosition` <[Object]>
+  - `x` <[float]>
+  - `y` <[float]>
+
+Drops on the target element at this point relative to the top-left corner of the element's padding box. If not specified, some visible point of the element is used.
+
+## input-checked
+* langs:
+  - alias-csharp: checkedState
+- `checked` <[boolean]>
+
+Whether to check or uncheck the checkbox.
+
 ## query-selector
 - `selector` <[string]>
 
 A selector to query for. See [working with selectors](./selectors.md) for more details.
+
+## find-selector
+- `selector` <[string]>
+
+A selector to use when resolving DOM element. See [working with selectors](./selectors.md) for more details.
 
 ## wait-for-selector-state
 - `state` <[WaitForSelectorState]<"attached"|"detached"|"visible"|"hidden">>
@@ -193,6 +240,13 @@ obtained via [`method: BrowserContext.storageState`].
 Populates context with given storage state. This option can be used to initialize context with logged-in information
 obtained via [`method: BrowserContext.storageState`]. Path to the file with saved storage state.
 
+## storagestate-option-path
+- `path` <[path]>
+
+The file path to save the storage state to. If [`option: path`] is a relative path, then it is resolved relative to
+current working directory. If no path is provided, storage
+state is still returned, but won't be saved to the disk.
+
 ## context-option-acceptdownloads
 - `acceptDownloads` <[boolean]>
 
@@ -201,22 +255,37 @@ Whether to automatically download all the attachments. Defaults to `false` where
 ## context-option-ignorehttpserrors
 - `ignoreHTTPSErrors` <[boolean]>
 
-Whether to ignore HTTPS errors during navigation. Defaults to `false`.
+Whether to ignore HTTPS errors when sending network requests. Defaults to `false`.
 
 ## context-option-bypasscsp
 - `bypassCSP` <[boolean]>
 
 Toggles bypassing page's Content-Security-Policy.
 
+## context-option-baseURL
+- `baseURL` <[string]>
+
+When using [`method: Page.goto`], [`method: Page.route`], [`method: Page.waitForURL`], [`method: Page.waitForRequest`], or [`method: Page.waitForResponse`] it takes the base URL in consideration by using the [`URL()`](https://developer.mozilla.org/en-US/docs/Web/API/URL/URL) constructor for building the corresponding URL. Examples:
+* baseURL: `http://localhost:3000` and navigating to `/bar.html` results in `http://localhost:3000/bar.html`
+* baseURL: `http://localhost:3000/foo/` and navigating to `./bar.html` results in `http://localhost:3000/foo/bar.html`
+
 ## context-option-viewport
-* langs: js, java, csharp
+* langs: js, java
   - alias-java: viewportSize
-  - alias-csharp: viewportSize
 - `viewport` <[null]|[Object]>
   - `width` <[int]> page width in pixels.
   - `height` <[int]> page height in pixels.
 
 Emulates consistent viewport for each page. Defaults to an 1280x720 viewport. `null` disables the default viewport.
+
+## csharp-context-option-viewport
+* langs: csharp
+  - alias-csharp: viewportSize
+- `viewport` <[null]|[Object]>
+  - `width` <[int]> page width in pixels.
+  - `height` <[int]> page height in pixels.
+
+Emulates consistent viewport for each page. Defaults to an 1280x720 viewport. Use `ViewportSize.NoViewport` to disable the default viewport.
 
 ## context-option-screen
 * langs:
@@ -228,6 +297,32 @@ Emulates consistent viewport for each page. Defaults to an 1280x720 viewport. `n
 
 Emulates consistent window screen size available inside web page via `window.screen`. Is only used when the
 [`option: viewport`] is set.
+
+## fetch-option-form
+- `form` <[Object]<[string], [string]|[float]|[boolean]>>
+
+Provides an object that will be serialized as html form using `application/x-www-form-urlencoded` encoding and sent as
+this request body. If this parameter is specified `content-type` header will be set to `application/x-www-form-urlencoded`
+unless explicitly provided.
+
+## fetch-option-multipart
+- `multipart` <[Object]<[string], [string]|[float]|[boolean]|[ReadStream]|[Object]>>
+  - `name` <[string]> File name
+  - `mimeType` <[string]> File type
+  - `buffer` <[Buffer]> File content
+
+Provides an object that will be serialized as html form using `multipart/form-data` encoding and sent as
+this request body. If this parameter is specified `content-type` header will be set to `multipart/form-data`
+unless explicitly provided. File values can be passed either as [`fs.ReadStream`](https://nodejs.org/api/fs.html#fs_class_fs_readstream)
+or as file-like object containing file name, mime-type and its content.
+
+## fetch-option-data
+- `data` <[string]|[Buffer]|[Serializable]>
+
+Allows to set post data of the request. If the data parameter is an object, it will be serialized to json string
+and `content-type` header will be set to `application/json` if not explicitly set. Otherwise the `content-type` header will be
+set to `application/octet-stream` if not explicitly set.
+
 
 ## evaluate-expression
 - `expression` <[string]>
@@ -333,7 +428,7 @@ A list of permissions to grant to all pages in this context. See
 ## context-option-extrahttpheaders
 - `extraHTTPHeaders` <[Object]<[string], [string]>>
 
-An object containing additional HTTP headers to be sent with every request. All header values must be strings.
+An object containing additional HTTP headers to be sent with every request.
 
 ## context-option-offline
 - `offline` <[boolean]>
@@ -352,6 +447,22 @@ Credentials for [HTTP authentication](https://developer.mozilla.org/en-US/docs/W
 
 Emulates `'prefers-colors-scheme'` media feature, supported values are `'light'`, `'dark'`, `'no-preference'`. See
 [`method: Page.emulateMedia`] for more details. Defaults to `'light'`.
+
+## context-option-reducedMotion
+- `reducedMotion` <[ReducedMotion]<"reduce"|"no-preference">>
+
+Emulates `'prefers-reduced-motion'` media feature, supported values are `'reduce'`, `'no-preference'`. See [`method: Page.emulateMedia`] for more details. Defaults
+to `'no-preference'`.
+
+## context-option-forcedColors
+- `forcedColors` <[ForcedColors]<"active"|"none">>
+
+Emulates `'forced-colors'` media feature, supported values are `'active'`, `'none'`. See [`method: Page.emulateMedia`] for more details. Defaults
+to `'none'`.
+
+:::note
+It's not supported in WebKit, see [here](https://bugs.webkit.org/show_bug.cgi?id=225281) in their issue tracker.
+:::
 
 ## context-option-logger
 * langs: js
@@ -442,12 +553,23 @@ Actual picture of each page will be scaled down if necessary to fit the specifie
   - `username` <[string]> Optional username to use if HTTP proxy requires authentication.
   - `password` <[string]> Optional password to use if HTTP proxy requires authentication.
 
-Network proxy settings to use with this context. Note that browser needs to be launched with the global proxy for this
-option to work. If all contexts override the proxy, global proxy will be never used and can be any string, for example
-`launch({ proxy: { server: 'per-context' } })`.
+Network proxy settings to use with this context.
+
+:::note
+For Chromium on Windows the browser needs to be launched with the global proxy for this option to work. If all
+contexts override the proxy, global proxy will be never used and can be any string, for example
+`launch({ proxy: { server: 'http://per-context' } })`.
+:::
+
+## context-option-strict
+- `strictSelectors` <[boolean]>
+
+It specified, enables strict selectors mode for this context. In the strict selectors mode all operations
+on selectors that imply single target DOM element will throw when more than one element matches the selector.
+See [Locator] to learn more about the strict mode.
 
 ## select-options-values
-* langs: java, js
+* langs: java, js, csharp
 - `values` <[null]|[string]|[ElementHandle]|[Array]<[string]>|[Object]|[Array]<[ElementHandle]>|[Array]<[Object]>>
   - `value` <[string]> Matches by `option.value`. Optional.
   - `label` <[string]> Matches by `option.label`. Optional.
@@ -460,9 +582,12 @@ is considered matching if all specified properties match.
 ## wait-for-navigation-url
 - `url` <[string]|[RegExp]|[function]\([URL]\):[boolean]>
 
-A glob pattern, regex pattern or predicate receiving [URL] to match while waiting for the navigation.
+A glob pattern, regex pattern or predicate receiving [URL] to match while waiting for the navigation. Note that if
+the parameter is a string without wilcard characters, the method will wait for navigation to URL that is exactly
+equal to the string.
 
 ## wait-for-event-event
+* langs: js, python, java
 - `event` <[string]>
 
 Event name, same one typically passed into `*.on(event)`.
@@ -486,6 +611,12 @@ Specify screenshot type, defaults to `png`.
 - `callback` <[Runnable]>
 
 Callback that performs the action triggering the event.
+
+## csharp-wait-for-event-action
+* langs: csharp
+- `action` <[Func<Task>]>
+
+Action that triggers the event.
 
 ## python-select-options-element
 * langs: python
@@ -513,8 +644,7 @@ only the first option matching one of the passed options is selected. Optional.
 Options to select by label. If the `<select>` has the `multiple` attribute, all given options are selected, otherwise
 only the first option matching one of the passed options is selected. Optional.
 
-## python-wait-for-event-predicate
-* langs: python
+## wait-for-event-predicate
 - `predicate` <[function]>
 
 Receives the event data and resolves to truthy value when the waiting should resolve.
@@ -533,29 +663,13 @@ The default value can be changed by using the [`method: BrowserContext.setDefaul
 Maximum time in milliseconds, defaults to 30 seconds, pass `0` to disable timeout. The default value can be changed by
 using the [`method: AndroidDevice.setDefaultTimeout`] method.
 
-## csharp-select-options-values
-* langs: csharp
-- `values` <[Array]<[Object]>>
-  - `value` <[string]> Matches by `option.value`. Optional.
-  - `label` <[string]> Matches by `option.label`. Optional.
-  - `index` <[int]> Matches by the index. Optional.
-
-Options to select. If the `<select>` has the `multiple` attribute, all matching options are selected, otherwise only the
-first option matching one of the passed options is selected. String values are equivalent to `{value:'string'}`. Option
-is considered matching if all specified properties match.
-
-## csharp-input-files
-* langs: csharp
-- `files` <[Array]<[Object]>>
-  - `name` <[string]> File name
-  - `mimeType` <[string]> File type
-  - `buffer` <[Buffer]> File content
-
 ## shared-context-params-list
 - %%-context-option-acceptdownloads-%%
 - %%-context-option-ignorehttpserrors-%%
 - %%-context-option-bypasscsp-%%
+- %%-context-option-baseURL-%%
 - %%-context-option-viewport-%%
+- %%-csharp-context-option-viewport-%%
 - %%-python-context-option-viewport-%%
 - %%-context-option-screen-%%
 - %%-python-context-option-no-viewport-%%
@@ -572,6 +686,8 @@ is considered matching if all specified properties match.
 - %%-context-option-offline-%%
 - %%-context-option-httpcredentials-%%
 - %%-context-option-colorscheme-%%
+- %%-context-option-reducedMotion-%%
+- %%-context-option-forcedColors-%%
 - %%-context-option-logger-%%
 - %%-context-option-videospath-%%
 - %%-context-option-videosize-%%
@@ -581,3 +697,118 @@ is considered matching if all specified properties match.
 - %%-context-option-recordvideo-%%
 - %%-context-option-recordvideo-dir-%%
 - %%-context-option-recordvideo-size-%%
+- %%-context-option-strict-%%
+
+## browser-option-args
+- `args` <[Array]<[string]>>
+
+Additional arguments to pass to the browser instance. The list of Chromium flags can be found
+[here](http://peter.sh/experiments/chromium-command-line-switches/).
+
+## browser-option-channel
+- `channel` <[string]>
+
+Browser distribution channel.  Supported values are "chrome", "chrome-beta", "chrome-dev", "chrome-canary", "msedge", "msedge-beta", "msedge-dev", "msedge-canary". Read more about using [Google Chrome and Microsoft Edge](./browsers.md#google-chrome--microsoft-edge).
+
+## browser-option-chromiumsandbox
+- `chromiumSandbox` <[boolean]>
+
+Enable Chromium sandboxing. Defaults to `false`.
+
+
+## browser-option-downloadspath
+- `downloadsPath` <[path]>
+
+If specified, accepted downloads are downloaded into this directory. Otherwise, temporary directory is created and is
+deleted when browser is closed. In either case, the downloads are deleted when the browser context they were created in
+is closed.
+
+## browser-option-executablepath
+- `executablePath` <[path]>
+
+Path to a browser executable to run instead of the bundled one. If [`option: executablePath`] is a relative path, then
+it is resolved relative to the current working directory. Note that Playwright only works with the bundled Chromium,
+Firefox or WebKit, use at your own risk.
+
+## browser-option-handlesigint
+- `handleSIGINT` <[boolean]>
+
+Close the browser process on Ctrl-C. Defaults to `true`.
+
+## browser-option-handlesigterm
+- `handleSIGTERM` <[boolean]>
+
+Close the browser process on SIGTERM. Defaults to `true`.
+
+## browser-option-handlesighup
+- `handleSIGHUP` <[boolean]>
+
+Close the browser process on SIGHUP. Defaults to `true`.
+
+## browser-option-headless
+- `headless` <[boolean]>
+
+Whether to run browser in headless mode. More details for
+[Chromium](https://developers.google.com/web/updates/2017/04/headless-chrome) and
+[Firefox](https://developer.mozilla.org/en-US/docs/Mozilla/Firefox/Headless_mode). Defaults to `true` unless the
+[`option: devtools`] option is `true`.
+
+## js-python-browser-option-firefoxuserprefs
+* langs: js, python
+- `firefoxUserPrefs` <[Object]<[string], [string]|[float]|[boolean]>>
+
+Firefox user preferences. Learn more about the Firefox user preferences at
+[`about:config`](https://support.mozilla.org/en-US/kb/about-config-editor-firefox).
+
+## csharp-java-browser-option-firefoxuserprefs
+* langs: csharp, java
+- `firefoxUserPrefs` <[Object]<[string], [any]>>
+
+Firefox user preferences. Learn more about the Firefox user preferences at
+[`about:config`](https://support.mozilla.org/en-US/kb/about-config-editor-firefox).
+
+## browser-option-logger
+* langs: js
+- `logger` <[Logger]>
+
+Logger sink for Playwright logging.
+
+## browser-option-timeout
+- `timeout` <[float]>
+
+Maximum time in milliseconds to wait for the browser instance to start. Defaults to `30000` (30 seconds). Pass `0` to
+disable timeout.
+
+## browser-option-tracesdir
+- `tracesDir` <[path]>
+
+If specified, traces are saved into this directory.
+
+## browser-option-devtools
+- `devtools` <[boolean]>
+
+**Chromium-only** Whether to auto-open a Developer Tools panel for each tab. If this option is `true`, the
+[`option: headless`] option will be set `false`.
+
+## browser-option-slowmo
+- `slowMo` <[float]>
+
+Slows down Playwright operations by the specified amount of milliseconds. Useful so that you can see what is going on.
+
+## shared-browser-options-list
+- %%-browser-option-args-%%
+- %%-browser-option-channel-%%
+- %%-browser-option-chromiumsandbox-%%
+- %%-browser-option-devtools-%%
+- %%-browser-option-downloadspath-%%
+- %%-csharp-java-browser-option-env-%%
+- %%-js-python-browser-option-env-%%
+- %%-browser-option-executablepath-%%
+- %%-browser-option-handlesigint-%%
+- %%-browser-option-handlesigterm-%%
+- %%-browser-option-handlesighup-%%
+- %%-browser-option-headless-%%
+- %%-browser-option-ignoredefaultargs-%%
+- %%-browser-option-proxy-%%
+- %%-browser-option-timeout-%%
+- %%-browser-option-tracesdir-%%

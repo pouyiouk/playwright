@@ -20,10 +20,5 @@ export type Rect = Size & Point;
 export type Quad = [ Point, Point, Point, Point ];
 export type URLMatch = string | RegExp | ((url: URL) => boolean);
 export type TimeoutOptions = { timeout?: number };
-
-export type StackFrame = {
-  file: string,
-  line?: number,
-  column?: number,
-  function?: string,
-};
+export type NameValue = { name: string, value: string };
+export type HeadersArray = NameValue[];

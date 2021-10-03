@@ -14,28 +14,32 @@
  * limitations under the License.
  */
 
+import extract from 'extract-zip';
 import fs from 'fs';
+import readline from 'readline';
+import os from 'os';
 import path from 'path';
+import rimraf from 'rimraf';
 import { createPlaywright } from '../../playwright';
-import * as util from 'util';
-import { TraceModel } from './traceModel';
-import { TraceEvent } from '../common/traceEvents';
+import { PersistentSnapshotStorage, TraceModel } from './traceModel';
 import { ServerRouteHandler, HttpServer } from '../../../utils/httpServer';
 import { SnapshotServer } from '../../snapshot/snapshotServer';
-import { PersistentSnapshotStorage } from '../../snapshot/snapshotStorage';
 import * as consoleApiSource from '../../../generated/consoleApiSource';
-import { isUnderTest } from '../../../utils/utils';
+import { isUnderTest, download } from '../../../utils/utils';
 import { internalCallMetadata } from '../../instrumentation';
 import { ProgressController } from '../../progress';
+import { BrowserContext } from '../../browserContext';
+import { findChromiumChannel } from '../../../utils/registry';
+import { installAppIcon } from '../../chromium/crApp';
+import { debugLogger } from '../../../utils/debugLogger';
 
-const fsReadFileAsync = util.promisify(fs.readFile.bind(fs));
-
-class TraceViewer {
+export class TraceViewer {
   private _server: HttpServer;
+  private _browserName: string;
 
-  constructor(traceDir: string, resourcesDir?: string) {
-    if (!resourcesDir)
-      resourcesDir = path.join(traceDir, 'resources');
+  constructor(tracesDir: string, browserName: string) {
+    this._browserName = browserName;
+    const resourcesDir = path.join(tracesDir, 'resources');
 
     // Served by TraceServer
     // - "/tracemodel" - json with trace model.
@@ -46,14 +50,14 @@ class TraceViewer {
     // - "/sha1/<sha1>" - trace resource bodies, used by network previews.
     //
     // Served by SnapshotServer
-    // - "/resources/<resourceId>" - network resources from the trace.
+    // - "/resources/" - network resources from the trace.
     // - "/snapshot/" - root for snapshot frame.
     // - "/snapshot/pageId/..." - actual snapshot html.
     // - "/snapshot/service-worker.js" - service worker that intercepts snapshot resources
-    //   and translates them into "/resources/<resourceId>".
-    const actionTraces = fs.readdirSync(traceDir).filter(name => name.endsWith('-actions.trace'));
+    //   and translates them into network requests.
+    const actionTraces = fs.readdirSync(tracesDir).filter(name => name.endsWith('.trace'));
     const debugNames = actionTraces.map(name => {
-      const tracePrefix = path.join(traceDir, name.substring(0, name.indexOf('-actions.trace')));
+      const tracePrefix = path.join(tracesDir, name.substring(0, name.indexOf('.trace')));
       return path.basename(tracePrefix);
     });
 
@@ -71,17 +75,19 @@ class TraceViewer {
 
     const traceModelHandler: ServerRouteHandler = (request, response) => {
       const debugName = request.url!.substring('/context/'.length);
-      const tracePrefix = path.join(traceDir, debugName);
       snapshotStorage.clear();
       response.statusCode = 200;
       response.setHeader('Content-Type', 'application/json');
       (async () => {
-        await snapshotStorage.load(tracePrefix);
-        const traceContent = await fsReadFileAsync(tracePrefix + '-actions.trace', 'utf8');
-        const events = traceContent.split('\n').map(line => line.trim()).filter(line => !!line).map(line => JSON.parse(line)) as TraceEvent[];
-        const model = new TraceModel();
-        model.appendEvents(events, snapshotStorage);
-        response.end(JSON.stringify(model.contextEntries.values().next().value));
+        const traceFile = path.join(tracesDir, debugName + '.trace');
+        const match = debugName.match(/^(.*)-\d+$/);
+        const networkFile = path.join(tracesDir, (match ? match[1] : debugName) + '.network');
+        const model = new TraceModel(snapshotStorage);
+        await appendTraceEvents(model, traceFile);
+        if (fs.existsSync(networkFile))
+          await appendTraceEvents(model, networkFile);
+        model.build();
+        response.end(JSON.stringify(model.contextEntry));
       })().catch(e => console.error(e));
       return true;
     };
@@ -116,22 +122,24 @@ class TraceViewer {
     this._server.routePrefix('/sha1/', sha1Handler);
   }
 
-  async show() {
+  async show(headless: boolean): Promise<BrowserContext> {
     const urlPrefix = await this._server.start();
 
-    const traceViewerPlaywright = createPlaywright(true);
-    const args = [
+    const traceViewerPlaywright = createPlaywright('javascript', true);
+    const traceViewerBrowser = isUnderTest() ? 'chromium' : this._browserName;
+    const args = traceViewerBrowser === 'chromium' ? [
       '--app=data:text/html,',
       '--window-size=1280,800'
-    ];
+    ] : [];
     if (isUnderTest())
       args.push(`--remote-debugging-port=0`);
-    const context = await traceViewerPlaywright.chromium.launchPersistentContext(internalCallMetadata(), '', {
+
+    const context = await traceViewerPlaywright[traceViewerBrowser as 'chromium'].launchPersistentContext(internalCallMetadata(), '', {
       // TODO: store language in the trace.
-      sdkLanguage: 'javascript',
+      channel: findChromiumChannel(traceViewerPlaywright.options.sdkLanguage),
       args,
       noDefaultViewport: true,
-      headless: !!process.env.PWTEST_CLI_HEADLESS,
+      headless,
       useWebSocket: isUnderTest()
     });
 
@@ -141,12 +149,68 @@ class TraceViewer {
     });
     await context.extendInjectedScript(consoleApiSource.source);
     const [page] = context.pages();
-    page.on('close', () => process.exit(0));
+
+    if (traceViewerBrowser === 'chromium')
+      await installAppIcon(page);
+
+    if (isUnderTest())
+      page.on('close', () => context.close(internalCallMetadata()).catch(() => {}));
+    else
+      page.on('close', () => process.exit());
+
     await page.mainFrame().goto(internalCallMetadata(), urlPrefix + '/traceviewer/traceViewer/index.html');
+    return context;
   }
 }
 
-export async function showTraceViewer(traceDir: string, resourcesDir?: string) {
-  const traceViewer = new TraceViewer(traceDir, resourcesDir);
-  await traceViewer.show();
+async function appendTraceEvents(model: TraceModel, file: string) {
+  const fileStream = fs.createReadStream(file, 'utf8');
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+  for await (const line of rl as any)
+    model.appendEvent(line);
+}
+
+export async function showTraceViewer(tracePath: string, browserName: string, headless = false): Promise<BrowserContext | undefined> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `playwright-trace`));
+  process.on('exit', () => rimraf.sync(dir));
+
+  if (/^https?:\/\//i.test(tracePath)){
+    const downloadZipPath = path.join(dir, 'trace.zip');
+    try {
+      await download(tracePath, downloadZipPath, {
+        progressBarName: tracePath,
+        log: debugLogger.log.bind(debugLogger, 'download')
+      });
+    } catch (error) {
+      console.log(`${error?.message || ''}`); // eslint-disable-line no-console
+      return;
+    }
+    tracePath = downloadZipPath;
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(tracePath);
+  } catch (e) {
+    console.log(`No such file or directory: ${tracePath}`);  // eslint-disable-line no-console
+    return;
+  }
+
+  if (stat.isDirectory()) {
+    const traceViewer = new TraceViewer(tracePath, browserName);
+    return await traceViewer.show(headless);
+  }
+
+  const zipFile = tracePath;
+  try {
+    await extract(zipFile, { dir });
+  } catch (e) {
+    console.log(`Invalid trace file: ${zipFile}`);  // eslint-disable-line no-console
+    return;
+  }
+  const traceViewer = new TraceViewer(dir, browserName);
+  return await traceViewer.show(headless);
 }

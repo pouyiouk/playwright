@@ -35,12 +35,12 @@ export class Screenshotter {
     const originalViewportSize = this._page.viewportSize();
     let viewportSize = originalViewportSize;
     if (!viewportSize)
-      viewportSize = await this._page.mainFrame().waitForFunctionValue(progress, () => ({ width: window.innerWidth, height: window.innerHeight }));
+      viewportSize = await this._page.mainFrame().waitForFunctionValueInUtility(progress, () => ({ width: window.innerWidth, height: window.innerHeight }));
     return { viewportSize, originalViewportSize };
   }
 
   private async _fullPageSize(progress: Progress): Promise<types.Size> {
-    const fullPageSize = await this._page.mainFrame().waitForFunctionValue(progress, () => {
+    const fullPageSize = await this._page.mainFrame().waitForFunctionValueInUtility(progress, () => {
       if (!document.body || !document.documentElement)
         return null;
       return {
@@ -122,7 +122,7 @@ export class Screenshotter {
       }
 
       progress.throwIfAborted(); // Avoid extra work.
-      const scrollOffset = await this._page.mainFrame().waitForFunctionValue(progress, () => ({ x: window.scrollX, y: window.scrollY }));
+      const scrollOffset = await this._page.mainFrame().waitForFunctionValueInUtility(progress, () => ({ x: window.scrollX, y: window.scrollY }));
       const documentRect = { ...boundingBox };
       documentRect.x += scrollOffset.x;
       documentRect.y += scrollOffset.y;
@@ -140,7 +140,7 @@ export class Screenshotter {
     progress.throwIfAborted(); // Screenshotting is expensive - avoid extra work.
     const shouldSetDefaultBackground = options.omitBackground && format === 'png';
     if (shouldSetDefaultBackground) {
-      await this._page._delegate.setBackgroundColor({ r: 0, g: 0, b: 0, a: 0});
+      await this._page._delegate.setBackgroundColor({ r: 0, g: 0, b: 0, a: 0 });
       progress.cleanupWhenAborted(() => this._page._delegate.setBackgroundColor());
     }
     progress.throwIfAborted(); // Avoid extra work.

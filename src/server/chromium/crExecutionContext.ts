@@ -21,6 +21,7 @@ import { Protocol } from './protocol';
 import * as js from '../javascript';
 import { rewriteErrorMessage } from '../../utils/stackTrace';
 import { parseEvaluationResultValue } from '../common/utilityScriptSerializers';
+import { isSessionClosedError } from '../common/protocolError';
 
 export class CRExecutionContext implements js.ExecutionContextDelegate {
   _client: CRSession;
@@ -31,13 +32,24 @@ export class CRExecutionContext implements js.ExecutionContextDelegate {
     this._contextId = contextPayload.id;
   }
 
-  async rawEvaluate(expression: string): Promise<string> {
+  async rawEvaluateJSON(expression: string): Promise<any> {
+    const { exceptionDetails, result: remoteObject } = await this._client.send('Runtime.evaluate', {
+      expression,
+      contextId: this._contextId,
+      returnByValue: true,
+    }).catch(rewriteError);
+    if (exceptionDetails)
+      throw new js.JavaScriptErrorInEvaluate(getExceptionMessage(exceptionDetails));
+    return remoteObject.value;
+  }
+
+  async rawEvaluateHandle(expression: string): Promise<js.ObjectId> {
     const { exceptionDetails, result: remoteObject } = await this._client.send('Runtime.evaluate', {
       expression,
       contextId: this._contextId,
     }).catch(rewriteError);
     if (exceptionDetails)
-      throw new Error('Evaluation failed: ' + getExceptionMessage(exceptionDetails));
+      throw new js.JavaScriptErrorInEvaluate(getExceptionMessage(exceptionDetails));
     return remoteObject.objectId!;
   }
 
@@ -65,7 +77,7 @@ export class CRExecutionContext implements js.ExecutionContextDelegate {
       userGesture: true
     }).catch(rewriteError);
     if (exceptionDetails)
-      throw new Error('Evaluation failed: ' + getExceptionMessage(exceptionDetails));
+      throw new js.JavaScriptErrorInEvaluate(getExceptionMessage(exceptionDetails));
     return returnByValue ? parseEvaluationResultValue(remoteObject.value) : utilityScript._context.createHandle(remoteObject);
   }
 
@@ -84,7 +96,7 @@ export class CRExecutionContext implements js.ExecutionContextDelegate {
   }
 
   createHandle(context: js.ExecutionContext, remoteObject: Protocol.Runtime.RemoteObject): js.JSHandle {
-    return new js.JSHandle(context, remoteObject.subtype || remoteObject.type, remoteObject.objectId, potentiallyUnserializableValue(remoteObject));
+    return new js.JSHandle(context, remoteObject.subtype || remoteObject.type, renderPreview(remoteObject), remoteObject.objectId, potentiallyUnserializableValue(remoteObject));
   }
 
   async releaseHandle(objectId: js.ObjectId): Promise<void> {
@@ -94,14 +106,14 @@ export class CRExecutionContext implements js.ExecutionContextDelegate {
 
 function rewriteError(error: Error): Protocol.Runtime.evaluateReturnValue {
   if (error.message.includes('Object reference chain is too long'))
-    return {result: {type: 'undefined'}};
+    return { result: { type: 'undefined' } };
   if (error.message.includes('Object couldn\'t be returned by value'))
-    return {result: {type: 'undefined'}};
+    return { result: { type: 'undefined' } };
 
-  if (error.message.endsWith('Cannot find context with specified id') || error.message.endsWith('Inspected target navigated or closed') || error.message.endsWith('Execution context was destroyed.'))
-    throw new Error('Execution context was destroyed, most likely because of a navigation.');
   if (error instanceof TypeError && error.message.startsWith('Converting circular structure to JSON'))
     rewriteErrorMessage(error, error.message + ' Are you passing a nested JSHandle?');
+  if (!js.isJavaScriptErrorInEvaluate(error) && !isSessionClosedError(error))
+    throw new Error('Execution context was destroyed, most likely because of a navigation.');
   throw error;
 }
 
@@ -109,4 +121,27 @@ function potentiallyUnserializableValue(remoteObject: Protocol.Runtime.RemoteObj
   const value = remoteObject.value;
   const unserializableValue = remoteObject.unserializableValue;
   return unserializableValue ? js.parseUnserializableValue(unserializableValue) : value;
+}
+
+function renderPreview(object: Protocol.Runtime.RemoteObject): string | undefined {
+  if (object.type === 'undefined')
+    return 'undefined';
+  if ('value' in object)
+    return String(object.value);
+  if (object.unserializableValue)
+    return String(object.unserializableValue);
+
+  if (object.description === 'Object' && object.preview) {
+    const tokens = [];
+    for (const { name, value } of object.preview.properties)
+      tokens.push(`${name}: ${value}`);
+    return `{${tokens.join(', ')}}`;
+  }
+  if (object.subtype === 'array' && object.preview) {
+    const result = [];
+    for (const { name, value } of object.preview.properties)
+      result[+name] = value;
+    return '[' + String(result) + ']';
+  }
+  return object.description;
 }

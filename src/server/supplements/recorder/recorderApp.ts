@@ -16,18 +16,15 @@
 
 import fs from 'fs';
 import path from 'path';
-import * as util from 'util';
-import { CRPage } from '../../chromium/crPage';
 import { Page } from '../../page';
 import { ProgressController } from '../../progress';
-import { createPlaywright } from '../../playwright';
 import { EventEmitter } from 'events';
 import { internalCallMetadata } from '../../instrumentation';
 import type { CallLog, EventData, Mode, Source } from './recorderTypes';
-import { BrowserContext } from '../../browserContext';
 import { isUnderTest } from '../../../utils/utils';
-
-const readFileAsync = util.promisify(fs.readFile);
+import * as mime from 'mime';
+import { installAppIcon } from '../../chromium/crApp';
+import { findChromiumChannel } from '../../../utils/registry';
 
 declare global {
   interface Window {
@@ -57,21 +54,17 @@ export class RecorderApp extends EventEmitter {
   }
 
   private async _init() {
-    const icon = await readFileAsync(require.resolve('../../../web/recorder/app_icon.png'));
-    const crPopup = this._page._delegate as CRPage;
-    await crPopup._mainFrameSession._client.send('Browser.setDockTile', {
-      image: icon.toString('base64')
-    });
+    await installAppIcon(this._page);
 
     await this._page._setServerRequestInterceptor(async route => {
       if (route.request().url().startsWith('https://playwright/')) {
         const uri = route.request().url().substring('https://playwright/'.length);
         const file = require.resolve('../../../web/recorder/' + uri);
-        const buffer = await readFileAsync(file);
+        const buffer = await fs.promises.readFile(file);
         await route.fulfill({
           status: 200,
           headers: [
-            { name: 'Content-Type', value: extensionToMime[path.extname(file)] }
+            { name: 'Content-Type', value: mime.getType(path.extname(file)) || 'application/octet-stream' }
           ],
           body: buffer.toString('base64'),
           isBase64: true
@@ -92,8 +85,8 @@ export class RecorderApp extends EventEmitter {
     await mainFrame.goto(internalCallMetadata(), 'https://playwright/index.html');
   }
 
-  static async open(inspectedContext: BrowserContext): Promise<RecorderApp> {
-    const recorderPlaywright = createPlaywright(true);
+  static async open(sdkLanguage: string): Promise<RecorderApp> {
+    const recorderPlaywright = (require('../../playwright').createPlaywright as typeof import('../../playwright').createPlaywright)('javascript', true);
     const args = [
       '--app=data:text/html,',
       '--window-size=600,600',
@@ -102,11 +95,10 @@ export class RecorderApp extends EventEmitter {
     if (process.env.PWTEST_RECORDER_PORT)
       args.push(`--remote-debugging-port=${process.env.PWTEST_RECORDER_PORT}`);
     const context = await recorderPlaywright.chromium.launchPersistentContext(internalCallMetadata(), '', {
-      channel: inspectedContext._browser.options.channel,
-      sdkLanguage: inspectedContext._options.sdkLanguage,
+      channel: findChromiumChannel(sdkLanguage),
       args,
       noDefaultViewport: true,
-      headless: !!process.env.PWTEST_CLI_HEADLESS || (isUnderTest() && !inspectedContext._browser.options.headful),
+      headless: !!process.env.PWTEST_CLI_HEADLESS || (isUnderTest() && !process.env.HEADFUL),
       useWebSocket: !!process.env.PWTEST_RECORDER_PORT
     });
     const controller = new ProgressController(internalCallMetadata(), context._browser);
@@ -169,16 +161,3 @@ export class RecorderApp extends EventEmitter {
     await this._page.bringToFront();
   }
 }
-
-const extensionToMime: { [key: string]: string } = {
-  '.css': 'text/css',
-  '.html': 'text/html',
-  '.jpeg': 'image/jpeg',
-  '.js': 'application/javascript',
-  '.png': 'image/png',
-  '.ttf': 'font/ttf',
-  '.svg': 'image/svg+xml',
-  '.webp': 'image/webp',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-};

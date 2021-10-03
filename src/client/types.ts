@@ -16,6 +16,8 @@
  */
 
 import * as channels from '../protocol/channels';
+import type { Size } from '../common/types';
+export { Size, Point, Rect, Quad, URLMatch, TimeoutOptions, HeadersArray } from '../common/types';
 
 type LoggerSeverity = 'verbose' | 'info' | 'warning' | 'error';
 export interface Logger {
@@ -23,9 +25,12 @@ export interface Logger {
   log(name: string, severity: LoggerSeverity, message: string | Error, args: any[], hints: { color?: string }): void;
 }
 
-import { Size } from '../common/types';
-export { Size, Point, Rect, Quad, URLMatch, TimeoutOptions } from '../common/types';
+export interface ClientSideInstrumentation {
+  onApiCallBegin(apiCall: string): { userObject: any };
+  onApiCallEnd(userData: { userObject: any }, error?: Error): any;
+}
 
+export type StrictOptions = { strict?: boolean };
 export type Headers = { [key: string]: string };
 export type Env = { [key: string]: string | number | boolean | undefined };
 
@@ -33,7 +38,7 @@ export type WaitForEventOptions = Function | { predicate?: Function, timeout?: n
 export type WaitForFunctionOptions = { timeout?: number, polling?: 'raf' | number };
 
 export type SelectOption = { value?: string, label?: string, index?: number };
-export type SelectOptionOptions = { timeout?: number, noWaitAfter?: boolean };
+export type SelectOptionOptions = { force?: boolean, timeout?: number, noWaitAfter?: boolean };
 export type FilePayload = { name: string, mimeType: string, buffer: Buffer };
 export type StorageState = {
   cookies: channels.NetworkCookie[],
@@ -53,7 +58,7 @@ export type BrowserContextOptions = Omit<channels.BrowserNewContextOptions, 'vie
   logger?: Logger,
   videosPath?: string,
   videoSize?: Size,
-  storageState?: string | channels.BrowserNewContextOptions['storageState'],
+  storageState?: string | SetStorageState,
 };
 
 type LaunchOverrides = {
@@ -70,11 +75,13 @@ export type LaunchPersistentContextOptions = Omit<LaunchOptionsBase & BrowserCon
 
 export type ConnectOptions = {
   wsEndpoint: string,
+  headers?: { [key: string]: string; };
   slowMo?: number,
   timeout?: number,
   logger?: Logger,
 };
 export type LaunchServerOptions = {
+  channel?: channels.BrowserTypeLaunchOptions['channel'],
   executablePath?: string,
   args?: string[],
   ignoreDefaultArgs?: boolean | string[],
@@ -94,6 +101,7 @@ export type LaunchServerOptions = {
   downloadsPath?: string,
   chromiumSandbox?: boolean,
   port?: number,
+  wsPath?: string,
   logger?: Logger,
 } & FirefoxUserPrefs;
 
@@ -106,4 +114,12 @@ export type SelectorEngine = {
    * Returns all elements matching given selector in the root's subtree.
    */
   queryAll(root: HTMLElement, selector: string): HTMLElement[];
+};
+
+export type RemoteAddr = channels.RemoteAddr;
+export type SecurityDetails = channels.SecurityDetails;
+
+export type NewRequestOptions = Omit<channels.PlaywrightNewRequestOptions, 'extraHTTPHeaders' | 'storageState'> & {
+  extraHTTPHeaders?: Headers,
+  storageState?: string | StorageState,
 };

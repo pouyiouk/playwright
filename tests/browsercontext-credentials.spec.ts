@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-import { test as it, expect } from './config/browserTest';
+import { browserTest as it, expect } from './config/browserTest';
 
-it('should fail without credentials', async ({browser, server, browserName, headful}) => {
-  it.fail(browserName === 'chromium' && headful);
+it('should fail without credentials', async ({ browser, server, browserName, headless }) => {
+  it.fail(browserName === 'chromium' && !headless);
 
   server.setAuth('/empty.html', 'user', 'pass');
   const context = await browser.newContext();
@@ -28,8 +28,8 @@ it('should fail without credentials', async ({browser, server, browserName, head
   await context.close();
 });
 
-it('should work with setHTTPCredentials', async ({browser, server, browserName, headful}) => {
-  it.fail(browserName === 'chromium' && headful);
+it('should work with setHTTPCredentials', async ({ browser, server, browserName, headless }) => {
+  it.fail(browserName === 'chromium' && !headless);
 
   server.setAuth('/empty.html', 'user', 'pass');
   const context = await browser.newContext();
@@ -42,7 +42,7 @@ it('should work with setHTTPCredentials', async ({browser, server, browserName, 
   await context.close();
 });
 
-it('should work with correct credentials', async ({browser, server}) => {
+it('should work with correct credentials', async ({ browser, server }) => {
   server.setAuth('/empty.html', 'user', 'pass');
   const context = await browser.newContext({
     httpCredentials: { username: 'user', password: 'pass' }
@@ -53,7 +53,7 @@ it('should work with correct credentials', async ({browser, server}) => {
   await context.close();
 });
 
-it('should fail with wrong credentials', async ({browser, server}) => {
+it('should fail with wrong credentials', async ({ browser, server }) => {
   server.setAuth('/empty.html', 'user', 'pass');
   const context = await browser.newContext({
     httpCredentials: { username: 'foo', password: 'bar' }
@@ -64,7 +64,7 @@ it('should fail with wrong credentials', async ({browser, server}) => {
   await context.close();
 });
 
-it('should return resource body', async ({browser, server}) => {
+it('should return resource body', async ({ browser, server }) => {
   server.setAuth('/playground.html', 'user', 'pass');
   const context = await browser.newContext({
     httpCredentials: { username: 'user', password: 'pass' }

@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-import { test as it, expect } from './config/playwrightTest';
+import { playwrightTest as it, expect } from './config/browserTest';
 import fs from 'fs';
+import path from 'path';
 
 it.describe('downloads path', () => {
-  it.beforeEach(async ({server}) => {
+  it.beforeEach(async ({ server }) => {
     server.setRoute('/download', (req, res) => {
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Content-Disposition', 'attachment; filename=file.txt');
@@ -26,7 +27,7 @@ it.describe('downloads path', () => {
     });
   });
 
-  it('should keep downloadsPath folder', async ({browserType, browserOptions, server}, testInfo)  => {
+  it('should keep downloadsPath folder', async ({ browserType, browserOptions, server }, testInfo)  => {
     const downloadsBrowser = await browserType.launch({ ...browserOptions, downloadsPath: testInfo.outputPath('') });
     const page = await downloadsBrowser.newPage();
     await page.setContent(`<a href="${server.PREFIX}/download">download</a>`);
@@ -42,7 +43,7 @@ it.describe('downloads path', () => {
     expect(fs.existsSync(testInfo.outputPath(''))).toBeTruthy();
   });
 
-  it('should delete downloads when context closes', async ({browserType, browserOptions, server}, testInfo) => {
+  it('should delete downloads when context closes', async ({ browserType, browserOptions, server }, testInfo) => {
     const downloadsBrowser = await browserType.launch({ ...browserOptions, downloadsPath: testInfo.outputPath('') });
     const page = await downloadsBrowser.newPage({ acceptDownloads: true });
     await page.setContent(`<a href="${server.PREFIX}/download">download</a>`);
@@ -57,7 +58,7 @@ it.describe('downloads path', () => {
     await downloadsBrowser.close();
   });
 
-  it('should report downloads in downloadsPath folder', async ({browserType, browserOptions, server}, testInfo) => {
+  it('should report downloads in downloadsPath folder', async ({ browserType, browserOptions, server }, testInfo) => {
     const downloadsBrowser = await browserType.launch({ ...browserOptions, downloadsPath: testInfo.outputPath('') });
     const page = await downloadsBrowser.newPage({ acceptDownloads: true });
     await page.setContent(`<a href="${server.PREFIX}/download">download</a>`);
@@ -71,7 +72,21 @@ it.describe('downloads path', () => {
     await downloadsBrowser.close();
   });
 
-  it('should accept downloads in persistent context', async ({launchPersistent, server}, testInfo)  => {
+  it('should report downloads in downloadsPath folder with a relative path', async ({ browserType, browserOptions, server }, testInfo) => {
+    const downloadsBrowser = await browserType.launch({ ...browserOptions, downloadsPath: path.relative(process.cwd(), testInfo.outputPath('')) });
+    const page = await downloadsBrowser.newPage({ acceptDownloads: true });
+    await page.setContent(`<a href="${server.PREFIX}/download">download</a>`);
+    const [ download ] = await Promise.all([
+      page.waitForEvent('download'),
+      page.click('a')
+    ]);
+    const downloadPath = await download.path();
+    expect(downloadPath.startsWith(testInfo.outputPath(''))).toBeTruthy();
+    await page.close();
+    await downloadsBrowser.close();
+  });
+
+  it('should accept downloads in persistent context', async ({ launchPersistent, server }, testInfo)  => {
     const { context, page } = await launchPersistent({ acceptDownloads: true, downloadsPath: testInfo.outputPath('') });
     await page.setContent(`<a href="${server.PREFIX}/download">download</a>`);
     const [ download ] = await Promise.all([
@@ -85,7 +100,7 @@ it.describe('downloads path', () => {
     await context.close();
   });
 
-  it('should delete downloads when persistent context closes', async ({launchPersistent, server}, testInfo) => {
+  it('should delete downloads when persistent context closes', async ({ launchPersistent, server }, testInfo) => {
     const { context, page } = await launchPersistent({ acceptDownloads: true, downloadsPath: testInfo.outputPath('') });
     await page.setContent(`<a href="${server.PREFIX}/download">download</a>`);
     const [ download ] = await Promise.all([

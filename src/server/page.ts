@@ -28,9 +28,10 @@ import { ConsoleMessage } from './console';
 import * as accessibility from './accessibility';
 import { FileChooser } from './fileChooser';
 import { Progress, ProgressController } from './progress';
-import { assert, createGuid, isError } from '../utils/utils';
+import { assert, isError } from '../utils/utils';
+import { ManualPromise } from '../utils/async';
 import { debugLogger } from '../utils/debugLogger';
-import { Selectors } from './selectors';
+import { SelectorInfo, Selectors } from './selectors';
 import { CallMetadata, SdkObject } from './instrumentation';
 import { Artifact } from './artifact';
 
@@ -70,7 +71,7 @@ export interface PageDelegate {
   getBoundingBox(handle: dom.ElementHandle): Promise<types.Rect | null>;
   getFrameElement(frame: frames.Frame): Promise<dom.ElementHandle>;
   scrollRectIntoViewIfNeeded(handle: dom.ElementHandle, rect?: types.Rect): Promise<'error:notvisible' | 'error:notconnected' | 'done'>;
-  setScreencastEnabled(enabled: boolean): Promise<void>;
+  setScreencastOptions(options: { width: number, height: number, quality: number } | null): Promise<void>;
 
   getAccessibilityTree(needle?: dom.ElementHandle): Promise<{tree: accessibility.AXNode, needle: accessibility.AXNode | null}>;
   pdf?: (options?: types.PDFOptions) => Promise<Buffer>;
@@ -88,6 +89,8 @@ type PageState = {
   emulatedSize: { screen: types.Size, viewport: types.Size } | null;
   mediaType: types.MediaType | null;
   colorScheme: types.ColorScheme | null;
+  reducedMotion: types.ReducedMotion | null;
+  forcedColors: types.ForcedColors | null;
   extraHTTPHeaders: types.HeadersArray | null;
 };
 
@@ -97,17 +100,12 @@ export class Page extends SdkObject {
     Crash: 'crash',
     Console: 'console',
     Dialog: 'dialog',
-    InternalDialogClosed: 'internaldialogclosed',
     Download: 'download',
     FileChooser: 'filechooser',
     DOMContentLoaded: 'domcontentloaded',
     // Can't use just 'error' due to node.js special treatment of error events.
     // @see https://nodejs.org/api/events.html#events_error_events
     PageError: 'pageerror',
-    Request: 'request',
-    Response: 'response',
-    RequestFailed: 'requestfailed',
-    RequestFinished: 'requestfinished',
     FrameAttached: 'frameattached',
     FrameDetached: 'framedetached',
     InternalFrameNavigatedToNewDocument: 'internalframenavigatedtonewdocument',
@@ -119,13 +117,11 @@ export class Page extends SdkObject {
   };
 
   private _closedState: 'open' | 'closing' | 'closed' = 'open';
-  private _closedCallback: () => void;
-  private _closedPromise: Promise<void>;
+  private _closedPromise = new ManualPromise<void>();
   private _disconnected = false;
-  private _disconnectedCallback: (e: Error) => void;
-  readonly _disconnectedPromise: Promise<Error>;
-  private _crashedCallback: (e: Error) => void;
-  readonly _crashedPromise: Promise<Error>;
+  private _initialized = false;
+  readonly _disconnectedPromise = new ManualPromise<Error>();
+  readonly _crashedPromise = new ManualPromise<Error>();
   readonly _browserContext: BrowserContext;
   readonly keyboard: input.Keyboard;
   readonly mouse: input.Mouse;
@@ -145,27 +141,21 @@ export class Page extends SdkObject {
   private _serverRequestInterceptor: network.RouteHandler | undefined;
   _ownedContext: BrowserContext | undefined;
   readonly selectors: Selectors;
-  readonly uniqueId: string;
   _pageIsError: Error | undefined;
   _video: Artifact | null = null;
   _opener: Page | undefined;
 
   constructor(delegate: PageDelegate, browserContext: BrowserContext) {
-    super(browserContext);
-    this.uniqueId = 'page@' + createGuid();
+    super(browserContext, 'page');
     this.attribution.page = this;
     this._delegate = delegate;
-    this._closedCallback = () => {};
-    this._closedPromise = new Promise(f => this._closedCallback = f);
-    this._disconnectedCallback = () => {};
-    this._disconnectedPromise = new Promise(f => this._disconnectedCallback = f);
-    this._crashedCallback = () => {};
-    this._crashedPromise = new Promise(f => this._crashedCallback = f);
     this._browserContext = browserContext;
     this._state = {
       emulatedSize: browserContext._options.viewport ? { viewport: browserContext._options.viewport, screen: browserContext._options.screen || browserContext._options.viewport } : null,
       mediaType: null,
-      colorScheme: null,
+      colorScheme: browserContext._options.colorScheme !== undefined  ? browserContext._options.colorScheme : 'light',
+      reducedMotion: browserContext._options.reducedMotion !== undefined  ? browserContext._options.reducedMotion : 'no-preference',
+      forcedColors: browserContext._options.forcedColors !== undefined  ? browserContext._options.forcedColors : 'none',
       extraHTTPHeaders: null,
     };
     this.accessibility = new accessibility.Accessibility(delegate.getAccessibilityTree.bind(delegate));
@@ -197,12 +187,17 @@ export class Page extends SdkObject {
         return;
       this._setIsError(error);
     }
+    this._initialized = true;
     this._browserContext.emit(BrowserContext.Events.Page, this);
     // I may happen that page iniatialization finishes after Close event has already been sent,
     // in that case we fire another Close event to ensure that each reported Page will have
     // corresponding Close event after it is reported on the context.
     if (this.isClosed())
       this.emit(Page.Events.Close);
+  }
+
+  initializedOrUndefined() {
+    return this._initialized ? this : undefined;
   }
 
   async _doSlowMo() {
@@ -217,20 +212,20 @@ export class Page extends SdkObject {
     assert(this._closedState !== 'closed', 'Page closed twice');
     this._closedState = 'closed';
     this.emit(Page.Events.Close);
-    this._closedCallback();
+    this._closedPromise.resolve();
   }
 
   _didCrash() {
     this._frameManager.dispose();
     this.emit(Page.Events.Crash);
-    this._crashedCallback(new Error('Page crashed'));
+    this._crashedPromise.resolve(new Error('Page crashed'));
   }
 
   _didDisconnect() {
     this._frameManager.dispose();
     assert(!this._disconnected, 'Page disconnected twice');
     this._disconnected = true;
-    this._disconnectedCallback(new Error('Page closed'));
+    this._disconnectedPromise.resolve(new Error('Page closed'));
   }
 
   async _onFileChooserOpened(handle: dom.ElementHandle) {
@@ -273,14 +268,13 @@ export class Page extends SdkObject {
     this._timeoutSettings.setDefaultTimeout(timeout);
   }
 
-  async exposeBinding(name: string, needsHandle: boolean, playwrightBinding: frames.FunctionWithSource, world: types.World = 'main') {
-    const identifier = PageBinding.identifier(name, world);
-    if (this._pageBindings.has(identifier))
+  async exposeBinding(name: string, needsHandle: boolean, playwrightBinding: frames.FunctionWithSource) {
+    if (this._pageBindings.has(name))
       throw new Error(`Function "${name}" has been already registered`);
-    if (this._browserContext._pageBindings.has(identifier))
+    if (this._browserContext._pageBindings.has(name))
       throw new Error(`Function "${name}" has been already registered in the browser context`);
-    const binding = new PageBinding(name, playwrightBinding, needsHandle, world);
-    this._pageBindings.set(identifier, binding);
+    const binding = new PageBinding(name, playwrightBinding, needsHandle);
+    this._pageBindings.set(name, binding);
     await this._delegate.exposeBinding(binding);
   }
 
@@ -296,7 +290,7 @@ export class Page extends SdkObject {
   }
 
   _addConsoleMessage(type: string, args: js.JSHandle[], location: types.ConsoleMessageLocation, text?: string) {
-    const message = new ConsoleMessage(type, text, args, location);
+    const message = new ConsoleMessage(this, type, text, args, location);
     const intercepted = this._frameManager.interceptConsoleMessage(message);
     if (intercepted || !this.listenerCount(Page.Events.Console))
       args.forEach(arg => arg.dispose());
@@ -360,15 +354,15 @@ export class Page extends SdkObject {
     }), this._timeoutSettings.navigationTimeout(options));
   }
 
-  async emulateMedia(options: { media?: types.MediaType | null, colorScheme?: types.ColorScheme | null }) {
-    if (options.media !== undefined)
-      assert(options.media === null || types.mediaTypes.has(options.media), 'media: expected one of (screen|print|null)');
-    if (options.colorScheme !== undefined)
-      assert(options.colorScheme === null || types.colorSchemes.has(options.colorScheme), 'colorScheme: expected one of (dark|light|no-preference|null)');
+  async emulateMedia(options: { media?: types.MediaType | null, colorScheme?: types.ColorScheme | null, reducedMotion?: types.ReducedMotion | null, forcedColors?: types.ForcedColors | null }) {
     if (options.media !== undefined)
       this._state.mediaType = options.media;
     if (options.colorScheme !== undefined)
       this._state.colorScheme = options.colorScheme;
+    if (options.reducedMotion !== undefined)
+      this._state.reducedMotion = options.reducedMotion;
+    if (options.forcedColors !== undefined)
+      this._state.forcedColors = options.forcedColors;
     await this._delegate.updateEmulateMedia();
     await this._doSlowMo();
   }
@@ -406,11 +400,8 @@ export class Page extends SdkObject {
     await this._delegate.updateRequestInterception();
   }
 
-  _requestStarted(request: network.Request) {
-    this.emit(Page.Events.Request, request);
-    const route = request._route();
-    if (!route)
-      return;
+  _requestStarted(request: network.Request, routeDelegate: network.RouteDelegate) {
+    const route = new network.Route(request, routeDelegate);
     if (this._serverRequestInterceptor) {
       this._serverRequestInterceptor(route, request);
       return;
@@ -439,7 +430,7 @@ export class Page extends SdkObject {
     const runBeforeUnload = !!options && !!options.runBeforeUnload;
     if (this._closedState !== 'closing') {
       this._closedState = 'closing';
-      assert(!this._disconnected, 'Protocol error: Connection closed. Most likely the page has been closed.');
+      assert(!this._disconnected, 'Target closed');
       // This might throw if the browser context containing the page closes
       // while we are trying to close the page.
       await this._delegate.closePage(runBeforeUnload).catch(e => debugLogger.log('error', e));
@@ -498,13 +489,21 @@ export class Page extends SdkObject {
     return [...this._browserContext._pageBindings.values(), ...this._pageBindings.values()];
   }
 
-  getBinding(name: string, world: types.World) {
-    const identifier = PageBinding.identifier(name, world);
-    return this._pageBindings.get(identifier) || this._browserContext._pageBindings.get(identifier);
+  getBinding(name: string) {
+    return this._pageBindings.get(name) || this._browserContext._pageBindings.get(name);
   }
 
-  setScreencastEnabled(enabled: boolean) {
-    this._delegate.setScreencastEnabled(enabled).catch(() => {});
+  setScreencastOptions(options: { width: number, height: number, quality: number } | null) {
+    this._delegate.setScreencastOptions(options).catch(e => debugLogger.log('error', e));
+  }
+
+  firePageError(error: Error) {
+    this.emit(Page.Events.PageError, error);
+  }
+
+  parseSelector(selector: string, options?: types.StrictOptions): SelectorInfo {
+    const strict = typeof options?.strict === 'boolean' ? options.strict : !!this.context()._options.strictSelectors;
+    return this.selectors.parseSelector(selector, strict);
   }
 }
 
@@ -519,7 +518,7 @@ export class Worker extends SdkObject {
   _existingExecutionContext: js.ExecutionContext | null = null;
 
   constructor(parent: SdkObject, url: string) {
-    super(parent);
+    super(parent, 'worker');
     this._url = url;
     this._executionContextCallback = () => {};
     this._executionContextPromise = new Promise(x => this._executionContextCallback = x);
@@ -548,25 +547,19 @@ export class PageBinding {
   readonly playwrightFunction: frames.FunctionWithSource;
   readonly source: string;
   readonly needsHandle: boolean;
-  readonly world: types.World;
 
-  constructor(name: string, playwrightFunction: frames.FunctionWithSource, needsHandle: boolean, world: types.World) {
+  constructor(name: string, playwrightFunction: frames.FunctionWithSource, needsHandle: boolean) {
     this.name = name;
     this.playwrightFunction = playwrightFunction;
     this.source = `(${addPageBinding.toString()})(${JSON.stringify(name)}, ${needsHandle})`;
     this.needsHandle = needsHandle;
-    this.world = world;
-  }
-
-  static identifier(name: string, world: types.World) {
-    return world + ':' + name;
   }
 
   static async dispatch(page: Page, payload: string, context: dom.FrameExecutionContext) {
-    const {name, seq, args} = JSON.parse(payload);
+    const { name, seq, args } = JSON.parse(payload);
     try {
       assert(context.world);
-      const binding = page.getBinding(name, context.world)!;
+      const binding = page.getBinding(name)!;
       let result: any;
       if (binding.needsHandle) {
         const handle = await context.evaluateHandle(takeHandle, { name, seq }).catch(e => null);
@@ -583,36 +576,36 @@ export class PageBinding {
     }
 
     function takeHandle(arg: { name: string, seq: number }) {
-      const handle = (window as any)[arg.name]['handles'].get(arg.seq);
-      (window as any)[arg.name]['handles'].delete(arg.seq);
+      const handle = (globalThis as any)[arg.name]['handles'].get(arg.seq);
+      (globalThis as any)[arg.name]['handles'].delete(arg.seq);
       return handle;
     }
 
     function deliverResult(arg: { name: string, seq: number, result: any }) {
-      (window as any)[arg.name]['callbacks'].get(arg.seq).resolve(arg.result);
-      (window as any)[arg.name]['callbacks'].delete(arg.seq);
+      (globalThis as any)[arg.name]['callbacks'].get(arg.seq).resolve(arg.result);
+      (globalThis as any)[arg.name]['callbacks'].delete(arg.seq);
     }
 
     function deliverError(arg: { name: string, seq: number, message: string, stack: string | undefined }) {
       const error = new Error(arg.message);
       error.stack = arg.stack;
-      (window as any)[arg.name]['callbacks'].get(arg.seq).reject(error);
-      (window as any)[arg.name]['callbacks'].delete(arg.seq);
+      (globalThis as any)[arg.name]['callbacks'].get(arg.seq).reject(error);
+      (globalThis as any)[arg.name]['callbacks'].delete(arg.seq);
     }
 
     function deliverErrorValue(arg: { name: string, seq: number, error: any }) {
-      (window as any)[arg.name]['callbacks'].get(arg.seq).reject(arg.error);
-      (window as any)[arg.name]['callbacks'].delete(arg.seq);
+      (globalThis as any)[arg.name]['callbacks'].get(arg.seq).reject(arg.error);
+      (globalThis as any)[arg.name]['callbacks'].delete(arg.seq);
     }
   }
 }
 
 function addPageBinding(bindingName: string, needsHandle: boolean) {
-  const binding = (window as any)[bindingName];
+  const binding = (globalThis as any)[bindingName];
   if (binding.__installed)
     return;
-  (window as any)[bindingName] = (...args: any[]) => {
-    const me = (window as any)[bindingName];
+  (globalThis as any)[bindingName] = (...args: any[]) => {
+    const me = (globalThis as any)[bindingName];
     if (needsHandle && args.slice(1).some(arg => arg !== undefined))
       throw new Error(`exposeBindingHandle supports a single argument, ${args.length} received`);
     let callbacks = me['callbacks'];
@@ -627,14 +620,14 @@ function addPageBinding(bindingName: string, needsHandle: boolean) {
       handles = new Map();
       me['handles'] = handles;
     }
-    const promise = new Promise((resolve, reject) => callbacks.set(seq, {resolve, reject}));
+    const promise = new Promise((resolve, reject) => callbacks.set(seq, { resolve, reject }));
     if (needsHandle) {
       handles.set(seq, args[0]);
-      binding(JSON.stringify({name: bindingName, seq}));
+      binding(JSON.stringify({ name: bindingName, seq }));
     } else {
-      binding(JSON.stringify({name: bindingName, seq, args}));
+      binding(JSON.stringify({ name: bindingName, seq, args }));
     }
     return promise;
   };
-  (window as any)[bindingName].__installed = true;
+  (globalThis as any)[bindingName].__installed = true;
 }

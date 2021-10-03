@@ -4,6 +4,7 @@ set -x
 
 trap "cd $(pwd -P)" EXIT
 SCRIPT_PATH="$(cd "$(dirname "$0")" ; pwd -P)"
+NODE_VERSION="14.17.6"
 
 cd "$(dirname "$0")"
 PACKAGE_VERSION=$(node -p "require('../../package.json').version")
@@ -13,12 +14,16 @@ mkdir -p ./output
 echo "Building playwright package"
 ../../packages/build_package.js playwright ./output/playwright.tgz
 
+echo "Building api.json and protocol.yml"
+node ../../utils/doclint/generateApiJson.js > ./output/api.json
+cp ../../src/protocol/protocol.yml ./output/
+
 function build {
   NODE_DIR=$1
   SUFFIX=$2
   ARCHIVE=$3
   RUN_DRIVER=$4
-  NODE_URL=https://nodejs.org/dist/v12.20.1/${NODE_DIR}.${ARCHIVE}
+  NODE_URL=https://nodejs.org/dist/v${NODE_VERSION}/${NODE_DIR}.${ARCHIVE}
 
   echo "Building playwright-${PACKAGE_VERSION}-${SUFFIX}"
 
@@ -45,6 +50,8 @@ function build {
   fi
 
   cp ./output/${NODE_DIR}/LICENSE ./output/playwright-${SUFFIX}/
+  cp ./output/api.json ./output/playwright-${SUFFIX}/package/
+  cp ./output/protocol.yml ./output/playwright-${SUFFIX}/package/
   cd ./output/playwright-${SUFFIX}/package
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 node "../../${NODE_DIR}/${NPM_PATH}" install --production
   rm package-lock.json
@@ -63,7 +70,7 @@ function build {
   zip -q -r ../playwright-${PACKAGE_VERSION}-${SUFFIX}.zip .
 }
 
-build "node-v12.20.1-darwin-x64" "mac" "tar.gz" "run-driver-posix.sh"
-build "node-v12.20.1-linux-x64" "linux" "tar.gz" "run-driver-posix.sh"
-build "node-v12.20.1-win-x64" "win32_x64" "zip" "run-driver-win.cmd"
-build "node-v12.20.1-win-x86" "win32" "zip" "run-driver-win.cmd"
+build "node-v${NODE_VERSION}-darwin-x64" "mac" "tar.gz" "run-driver-posix.sh"
+build "node-v${NODE_VERSION}-linux-x64" "linux" "tar.gz" "run-driver-posix.sh"
+build "node-v${NODE_VERSION}-win-x64" "win32_x64" "zip" "run-driver-win.cmd"
+build "node-v${NODE_VERSION}-win-x86" "win32" "zip" "run-driver-win.cmd"

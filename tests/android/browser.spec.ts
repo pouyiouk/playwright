@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-import { test, expect } from '../config/androidTest';
+import { androidTest as test, expect } from './androidTest';
 
 test('androidDevice.model', async function({ androidDevice }) {
-  expect(androidDevice.model()).toBe('sdk_gphone_x86_arm');
+  expect(androidDevice.model()).toBe('sdk_gphone64_x86_64');
 });
 
 test('androidDevice.launchBrowser', async function({ androidDevice }) {
@@ -52,6 +52,6 @@ test('should be able to send CDP messages', async ({ androidDevice }) => {
   const [page] = context.pages();
   const client = await context.newCDPSession(page);
   await client.send('Runtime.enable');
-  const evalResponse = await client.send('Runtime.evaluate', {expression: '1 + 2', returnByValue: true});
+  const evalResponse = await client.send('Runtime.evaluate', { expression: '1 + 2', returnByValue: true });
   expect(evalResponse.result.value).toBe(3);
 });

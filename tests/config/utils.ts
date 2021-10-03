@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { expect } from 'folio';
+import { expect } from './test-runner';
 import type { Frame, Page } from '../../index';
 
 export async function attachFrame(page: Page, frameId: string, url: string): Promise<Frame> {
@@ -57,4 +57,34 @@ export function expectedSSLError(browserName: string): string {
     expectedSSLError = 'SSL_ERROR_UNKNOWN';
   }
   return expectedSSLError;
+}
+
+export function chromiumVersionLessThan(a: string, b: string) {
+  const left: number[] = a.split('.').map(e => Number(e));
+  const right: number[] = b.split('.').map(e => Number(e));
+  for (let i = 0; i < 4; i++) {
+    if (left[i] > right[i])
+      return false;
+    if (left[i] < right[i])
+      return true;
+  }
+  return false;
+}
+
+let didSuppressUnverifiedCertificateWarning = false;
+let originalEmitWarning: (warning: string | Error, ...args: any[]) => void;
+export function suppressCertificateWarning() {
+  if (didSuppressUnverifiedCertificateWarning)
+    return;
+  didSuppressUnverifiedCertificateWarning = true;
+  // Supress one-time warning:
+  // https://github.com/nodejs/node/blob/1bbe66f432591aea83555d27dd76c55fea040a0d/lib/internal/options.js#L37-L49
+  originalEmitWarning = process.emitWarning;
+  process.emitWarning = (warning, ...args) => {
+    if (typeof warning === 'string' && warning.includes('NODE_TLS_REJECT_UNAUTHORIZED')) {
+      process.emitWarning = originalEmitWarning;
+      return;
+    }
+    return originalEmitWarning.call(process, warning, ...args);
+  };
 }

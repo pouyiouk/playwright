@@ -37,14 +37,9 @@ run().catch(e => {
 });;
 
 async function run() {
-  const documentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'api'));
-  // This validates member links.
-  documentation.setLinkRenderer(() => undefined);
-  documentation.filterForLanguage('js');
-
   // Patch README.md
+  const versions = await getBrowserVersions();
   {
-    const versions = await getBrowserVersions();
     const params = new Map();
     const { chromium, firefox, webkit } = versions;
     params.set('chromium-version', chromium);
@@ -65,21 +60,80 @@ async function run() {
     writeAssumeNoop(path.join(PROJECT_DIR, 'README.md'), content, dirtyFiles);
   }
 
+  // Update device descriptors
+  {
+    const devicesDescriptorsSourceFile = path.join(PROJECT_DIR, 'src', 'server', 'deviceDescriptorsSource.json')
+    const devicesDescriptors = require(devicesDescriptorsSourceFile)
+    for (const deviceName of Object.keys(devicesDescriptors)) {
+      switch (devicesDescriptors[deviceName].defaultBrowserType) {
+        case 'chromium':
+          devicesDescriptors[deviceName].userAgent = devicesDescriptors[deviceName].userAgent.replace(
+            /(.*Chrome\/)(.*?)( .*)/,
+            `$1${versions.chromium}$3`
+          ).replace(
+            /(.*Edg\/)(.*?)$/,
+            `$1${versions.chromium}`
+          )
+          break;
+        case 'firefox':
+          devicesDescriptors[deviceName].userAgent = devicesDescriptors[deviceName].userAgent.replace(
+            /^(.*Firefox\/)(.*?)( .*?)?$/,
+            `$1${versions.firefox}$3`
+          ).replace(/(.*rv:)(.*)\)(.*?)/, `$1${versions.firefox}$3`)
+          break;
+        case 'webkit':
+          devicesDescriptors[deviceName].userAgent = devicesDescriptors[deviceName].userAgent.replace(
+            /(.*Version\/)(.*?)( .*)/,
+            `$1${versions.webkit}$3`
+          )
+          break;
+        default:
+          break;
+      }
+    }
+    writeAssumeNoop(devicesDescriptorsSourceFile, JSON.stringify(devicesDescriptors, null, 2), dirtyFiles);
+  }
+
   // Validate links
   {
-    for (const file of fs.readdirSync(path.join(PROJECT_DIR, 'docs', 'src'))) {
-      if (!file.endsWith('.md'))
-        continue;
-      const data = fs.readFileSync(path.join(PROJECT_DIR, 'docs', 'src', file)).toString();
-      documentation.renderLinksInText(md.parse(data));
+    const langs = ['js', 'java', 'python', 'csharp'];
+    for (const lang of langs) {
+      try {
+        let documentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'api'));
+        documentation.filterForLanguage(lang);
+        if (lang === 'js') {
+          const testDocumentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'test-api'), path.join(PROJECT_DIR, 'docs', 'src', 'api', 'params.md'));
+          testDocumentation.filterForLanguage('js');
+          const testRerpoterDocumentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'test-reporter-api'));
+          testRerpoterDocumentation.filterForLanguage('js');
+          documentation = documentation.mergeWith(testDocumentation).mergeWith(testRerpoterDocumentation);
+        }
+
+        // This validates member links.
+        documentation.setLinkRenderer(() => undefined);
+
+        for (const file of fs.readdirSync(path.join(PROJECT_DIR, 'docs', 'src'))) {
+          if (!file.endsWith('.md'))
+            continue;
+          if (langs.some(other => other !== lang && file.endsWith(`-${other}.md`)))
+            continue;
+          const data = fs.readFileSync(path.join(PROJECT_DIR, 'docs', 'src', file)).toString();
+          documentation.renderLinksInText(md.filterNodesForLanguage(md.parse(data), lang));
+        }
+      } catch (e) {
+        e.message = `While processing "${lang}"\n` + e.message;
+        throw e;
+      }
     }
   }
 
   // Check for missing docs
   {
+    const apiDocumentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'api'));
+    apiDocumentation.filterForLanguage('js');
     const srcClient = path.join(PROJECT_DIR, 'src', 'client');
     const sources = fs.readdirSync(srcClient).map(n => path.join(srcClient, n));
-    const errors = missingDocs(documentation, sources, path.join(srcClient, 'api.ts'));
+    const errors = missingDocs(apiDocumentation, sources, path.join(srcClient, 'api.ts'));
     if (errors.length) {
       console.log('============================');
       console.log('ERROR: missing documentation:');

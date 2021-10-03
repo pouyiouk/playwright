@@ -34,7 +34,7 @@ declare global {
 export interface RecorderProps {
   sources: Source[],
   paused: boolean,
-  log: Map<number, CallLog>,
+  log: Map<string, CallLog>,
   mode: Mode,
   initialSelector?: string,
 }
@@ -80,8 +80,8 @@ export const Recorder: React.FC<RecorderProps> = ({
 
   return <div className='recorder'>
     <Toolbar>
-      <ToolbarButton icon='record' title='Record' toggled={mode == 'recording'} onClick={() => {
-        window.dispatch({ event: 'setMode', params: { mode: mode === 'recording' ? 'none' : 'recording' }});
+      <ToolbarButton icon='record' title='Record' toggled={mode === 'recording'} onClick={() => {
+        window.dispatch({ event: 'setMode', params: { mode: mode === 'recording' ? 'none' : 'recording' } });
       }}>Record</ToolbarButton>
       <ToolbarButton icon='files' title='Copy' disabled={!source || !source.text} onClick={() => {
         copy(source.text);
@@ -95,16 +95,17 @@ export const Recorder: React.FC<RecorderProps> = ({
       <ToolbarButton icon='debug-step-over' title='Step over' disabled={!paused} onClick={() => {
         window.dispatch({ event: 'step' });
       }}></ToolbarButton>
+      <div style={{ flex: 'auto' }}></div>
+      <div>Target:</div>
       <select className='recorder-chooser' hidden={!sources.length} value={file} onChange={event => {
-          setFile(event.target.selectedOptions[0].value);
-        }}>{
+        setFile(event.target.selectedOptions[0].value);
+      }}>{
           sources.map(s => {
             const title = s.file.replace(/.*[/\\]([^/\\]+)/, '$1');
             return <option key={s.file} value={s.file}>{title}</option>;
           })
         }
       </select>
-      <div style={{flex: 'auto'}}></div>
       <ToolbarButton icon='clear-all' title='Clear' disabled={!source || !source.text} onClick={() => {
         window.dispatch({ event: 'clear' });
       }}></ToolbarButton>
@@ -113,17 +114,15 @@ export const Recorder: React.FC<RecorderProps> = ({
       <SourceView text={source.text} language={source.language} highlight={source.highlight} revealLine={source.revealLine}></SourceView>
       <div className='vbox'>
         <Toolbar>
-          <ToolbarButton icon='microscope' title='Explore' toggled={mode == 'inspecting'} onClick={() => {
-            window.dispatch({ event: 'setMode', params: { mode: mode === 'inspecting' ? 'none' : 'inspecting' }}).catch(() => { });
+          <ToolbarButton icon='microscope' title='Explore' toggled={mode === 'inspecting'} onClick={() => {
+            window.dispatch({ event: 'setMode', params: { mode: mode === 'inspecting' ? 'none' : 'inspecting' } }).catch(() => { });
           }}>Explore</ToolbarButton>
           <input ref={selectorInputRef} className='selector-input' placeholder='Playwright Selector' value={selector} disabled={mode !== 'none'} onChange={event => {
             setSelector(event.target.value);
             window.dispatch({ event: 'selectorUpdated', params: { selector: event.target.value } });
           }} />
         </Toolbar>
-        <CallLogView log={Array.from(log.values())} onHover={(callLog, phase) => {
-          window.dispatch({ event: 'callLogHovered', params: { callLogId: callLog?.id, phase } });
-        }}/>
+        <CallLogView log={Array.from(log.values())}/>
       </div>
     </SplitView>
   </div>;

@@ -14,109 +14,114 @@
  * limitations under the License.
  */
 
-import fs from 'fs';
-import * as util from 'util';
 import { BrowserContext } from '../../browserContext';
 import { helper } from '../../helper';
 import * as network from '../../network';
 import { Page } from '../../page';
-import { InstrumentationListener } from '../../instrumentation';
 import * as har from './har';
+import { calculateSha1, monotonicTime } from '../../../utils/utils';
+import { eventsHelper, RegisteredListener } from '../../../utils/eventsHelper';
+import * as mime from 'mime';
+import { ManualPromise } from '../../../utils/async';
 
-const fsWriteFileAsync = util.promisify(fs.writeFile.bind(fs));
+const FALLBACK_HTTP_VERSION = 'HTTP/1.1';
 
-export class HarTracer implements InstrumentationListener {
-  private _contextTracers = new Map<BrowserContext, HarContextTracer>();
-
-  async onContextCreated(context: BrowserContext): Promise<void> {
-    if (!context._options.recordHar)
-      return;
-    const contextTracer = new HarContextTracer(context, context._options.recordHar);
-    this._contextTracers.set(context, contextTracer);
-  }
-
-  async onContextWillDestroy(context: BrowserContext): Promise<void> {
-    const contextTracer = this._contextTracers.get(context);
-    if (contextTracer) {
-      this._contextTracers.delete(context);
-      await contextTracer.flush();
-    }
-  }
+export interface HarTracerDelegate {
+  onEntryStarted(entry: har.Entry): void;
+  onEntryFinished(entry: har.Entry): void;
+  onContentBlob(sha1: string, buffer: Buffer): void;
 }
 
-type HarOptions = {
-  path: string;
-  omitContent?: boolean;
+type HarTracerOptions = {
+  content: 'omit' | 'sha1' | 'embedded';
+  skipScripts: boolean;
+  waitForContentOnStop: boolean;
 };
 
-class HarContextTracer {
-  private _options: HarOptions;
-  private _log: har.Log;
-  private _pageEntries = new Map<Page, har.Page>();
-  private _entries = new Map<network.Request, har.Entry>();
-  private _lastPage = 0;
+export class HarTracer {
+  private _context: BrowserContext;
   private _barrierPromises = new Set<Promise<void>>();
+  private _delegate: HarTracerDelegate;
+  private _options: HarTracerOptions;
+  private _pageEntries = new Map<Page, har.Page>();
+  private _eventListeners: RegisteredListener[] = [];
+  private _started = false;
+  private _entrySymbol: symbol;
 
-  constructor(context: BrowserContext, options: HarOptions) {
+  constructor(context: BrowserContext, delegate: HarTracerDelegate, options: HarTracerOptions) {
+    this._context = context;
+    this._delegate = delegate;
     this._options = options;
-    this._log = {
-      version: '1.2',
-      creator: {
-        name: 'Playwright',
-        version: require('../../../../package.json')['version'],
-      },
-      browser: {
-        name: context._browser.options.name,
-        version: context._browser.version()
-      },
-      pages: [],
-      entries: []
-    };
-    context.on(BrowserContext.Events.Page, page => this._onPage(page));
+    this._entrySymbol = Symbol('requestHarEntry');
   }
 
-  private _onPage(page: Page) {
-    const pageEntry: har.Page = {
-      startedDateTime: new Date(),
-      id: `page_${this._lastPage++}`,
-      title: '',
-      pageTimings: {
-        onContentLoad: -1,
-        onLoad: -1,
-      },
-    };
-    this._pageEntries.set(page, pageEntry);
-    this._log.pages.push(pageEntry);
-    page.on(Page.Events.Request, (request: network.Request) => this._onRequest(page, request));
-    page.on(Page.Events.Response, (response: network.Response) => this._onResponse(page, response));
+  start() {
+    if (this._started)
+      return;
+    this._started = true;
+    this._eventListeners = [
+      eventsHelper.addEventListener(this._context, BrowserContext.Events.Page, (page: Page) => this._ensurePageEntry(page)),
+      eventsHelper.addEventListener(this._context, BrowserContext.Events.Request, (request: network.Request) => this._onRequest(request)),
+      eventsHelper.addEventListener(this._context, BrowserContext.Events.RequestFinished, ({ request, response }) => this._onRequestFinished(request, response).catch(() => {})),
+      eventsHelper.addEventListener(this._context, BrowserContext.Events.Response, (response: network.Response) => this._onResponse(response)),
+    ];
+  }
 
-    page.on(Page.Events.DOMContentLoaded, () => {
-      const promise = page.mainFrame().evaluateExpression(String(() => {
-        return {
-          title: document.title,
-          domContentLoaded: performance.timing.domContentLoadedEventStart,
-        };
-      }), true, undefined, 'utility').then(result => {
-        pageEntry.title = result.title;
-        pageEntry.pageTimings.onContentLoad = result.domContentLoaded;
-      }).catch(() => {});
-      this._addBarrier(page, promise);
-    });
-    page.on(Page.Events.Load, () => {
-      const promise = page.mainFrame().evaluateExpression(String(() => {
-        return {
-          title: document.title,
-          loaded: performance.timing.loadEventStart,
-        };
-      }), true, undefined, 'utility').then(result => {
-        pageEntry.title = result.title;
-        pageEntry.pageTimings.onLoad = result.loaded;
-      }).catch(() => {});
-      this._addBarrier(page, promise);
-    });
+  private _entryForRequest(request: network.Request): har.Entry | undefined {
+    return (request as any)[this._entrySymbol];
+  }
+
+  private _ensurePageEntry(page: Page) {
+    let pageEntry = this._pageEntries.get(page);
+    if (!pageEntry) {
+      page.on(Page.Events.DOMContentLoaded, () => this._onDOMContentLoaded(page));
+      page.on(Page.Events.Load, () => this._onLoad(page));
+
+      pageEntry = {
+        startedDateTime: new Date(),
+        id: page.guid,
+        title: '',
+        pageTimings: {
+          onContentLoad: -1,
+          onLoad: -1,
+        },
+      };
+      this._pageEntries.set(page, pageEntry);
+    }
+    return pageEntry;
+  }
+
+  private _onDOMContentLoaded(page: Page) {
+    const pageEntry = this._ensurePageEntry(page);
+    const promise = page.mainFrame().evaluateExpression(String(() => {
+      return {
+        title: document.title,
+        domContentLoaded: performance.timing.domContentLoadedEventStart,
+      };
+    }), true, undefined, 'utility').then(result => {
+      pageEntry.title = result.title;
+      pageEntry.pageTimings.onContentLoad = result.domContentLoaded;
+    }).catch(() => {});
+    this._addBarrier(page, promise);
+  }
+
+  private _onLoad(page: Page) {
+    const pageEntry = this._ensurePageEntry(page);
+    const promise = page.mainFrame().evaluateExpression(String(() => {
+      return {
+        title: document.title,
+        loaded: performance.timing.loadEventStart,
+      };
+    }), true, undefined, 'utility').then(result => {
+      pageEntry.title = result.title;
+      pageEntry.pageTimings.onLoad = result.loaded;
+    }).catch(() => {});
+    this._addBarrier(page, promise);
   }
 
   private _addBarrier(page: Page, promise: Promise<void>) {
+    if (!this._options.waitForContentOnStop)
+      return;
     const race = Promise.race([
       new Promise<void>(f => page.on('close', () => {
         this._barrierPromises.delete(race);
@@ -127,40 +132,45 @@ class HarContextTracer {
     this._barrierPromises.add(race);
   }
 
-  private _onRequest(page: Page, request: network.Request) {
-    const pageEntry = this._pageEntries.get(page)!;
+  private _onRequest(request: network.Request) {
+    const page = request.frame()._page;
     const url = network.parsedURL(request.url());
     if (!url)
       return;
 
+    const pageEntry = this._ensurePageEntry(page);
     const harEntry: har.Entry = {
       pageref: pageEntry.id,
+      _requestref: request.guid,
+      _frameref: request.frame().guid,
+      _monotonicTime: monotonicTime(),
       startedDateTime: new Date(),
       time: -1,
       request: {
         method: request.method(),
         url: request.url(),
-        httpVersion: 'HTTP/1.1',
+        httpVersion: FALLBACK_HTTP_VERSION,
         cookies: [],
         headers: [],
         queryString: [...url.searchParams].map(e => ({ name: e[0], value: e[1] })),
-        postData: undefined,
+        postData: postDataForHar(request, this._options.content),
         headersSize: -1,
-        bodySize: -1,
+        bodySize: request.bodySize(),
       },
       response: {
         status: -1,
         statusText: '',
-        httpVersion: 'HTTP/1.1',
+        httpVersion: FALLBACK_HTTP_VERSION,
         cookies: [],
         headers: [],
         content: {
           size: -1,
-          mimeType: request.headerValue('content-type') || 'application/octet-stream',
+          mimeType: request.headerValue('content-type') || 'x-unknown',
         },
         headersSize: -1,
         bodySize: -1,
-        redirectURL: ''
+        redirectURL: '',
+        _transferSize: -1
       },
       cache: {
         beforeRequest: null,
@@ -173,59 +183,181 @@ class HarContextTracer {
       },
     };
     if (request.redirectedFrom()) {
-      const fromEntry = this._entries.get(request.redirectedFrom()!)!;
-      fromEntry.response.redirectURL = request.url();
+      const fromEntry = this._entryForRequest(request.redirectedFrom()!);
+      if (fromEntry)
+        fromEntry.response.redirectURL = request.url();
     }
-    this._log.entries.push(harEntry);
-    this._entries.set(request, harEntry);
+    (request as any)[this._entrySymbol] = harEntry;
+    if (this._started)
+      this._delegate.onEntryStarted(harEntry);
   }
 
-  private _onResponse(page: Page, response: network.Response) {
-    const pageEntry = this._pageEntries.get(page)!;
-    const harEntry = this._entries.get(response.request())!;
-    // Rewrite provisional headers with actual
+  private async _onRequestFinished(request: network.Request, response: network.Response | null) {
+    if (!response)
+      return;
+    const page = request.frame()._page;
+    const harEntry = this._entryForRequest(request);
+    if (!harEntry)
+      return;
+
+    const httpVersion = response.httpVersion();
+    harEntry.request.httpVersion = httpVersion;
+    harEntry.response.httpVersion = httpVersion;
+
+    const compressionCalculationBarrier = {
+      _encodedBodySize: -1,
+      _decodedBodySize: -1,
+      barrier: new ManualPromise<void>(),
+      _check: function() {
+        if (this._encodedBodySize !== -1 && this._decodedBodySize !== -1) {
+          harEntry.response.content.compression = Math.max(0, this._decodedBodySize - this._encodedBodySize);
+          this.barrier.resolve();
+        }
+      },
+      setEncodedBodySize: function(encodedBodySize: number){
+        this._encodedBodySize = encodedBodySize;
+        this._check();
+      },
+      setDecodedBodySize: function(decodedBodySize: number) {
+        this._decodedBodySize = decodedBodySize;
+        this._check();
+      }
+    };
+    this._addBarrier(page, compressionCalculationBarrier.barrier);
+
+    const promise = response.body().then(buffer => {
+      if (this._options.skipScripts && request.resourceType() === 'script') {
+        compressionCalculationBarrier.setDecodedBodySize(0);
+        return;
+      }
+
+      const content = harEntry.response.content;
+      content.size = buffer.length;
+      compressionCalculationBarrier.setDecodedBodySize(buffer.length);
+      if (buffer && buffer.length > 0) {
+        if (this._options.content === 'embedded') {
+          content.text = buffer.toString('base64');
+          content.encoding = 'base64';
+        } else if (this._options.content === 'sha1') {
+          content._sha1 = calculateSha1(buffer) + '.' + (mime.getExtension(content.mimeType) || 'dat');
+          if (this._started)
+            this._delegate.onContentBlob(content._sha1, buffer);
+        }
+      }
+    }).catch(() => {
+      compressionCalculationBarrier.setDecodedBodySize(0);
+    }).then(() => {
+      const postData = response.request().postDataBuffer();
+      if (postData && harEntry.request.postData && this._options.content === 'sha1') {
+        harEntry.request.postData._sha1 = calculateSha1(postData) + '.' + (mime.getExtension(harEntry.request.postData.mimeType) || 'dat');
+        if (this._started)
+          this._delegate.onContentBlob(harEntry.request.postData._sha1, postData);
+      }
+      if (this._started)
+        this._delegate.onEntryFinished(harEntry);
+    });
+    this._addBarrier(page, promise);
+    this._addBarrier(page, response.sizes().then(sizes => {
+      harEntry.response.bodySize = sizes.responseBodySize;
+      harEntry.response.headersSize = sizes.responseHeadersSize;
+      // Fallback for WebKit by calculating it manually
+      harEntry.response._transferSize = response.request().responseSize.transferSize || (sizes.responseHeadersSize + sizes.responseBodySize);
+      harEntry.request.headersSize = sizes.requestHeadersSize;
+      compressionCalculationBarrier.setEncodedBodySize(sizes.responseBodySize);
+    }));
+  }
+
+  private _onResponse(response: network.Response) {
+    const page = response.frame()._page;
+    const pageEntry = this._ensurePageEntry(page);
+    const harEntry = this._entryForRequest(response.request());
+    if (!harEntry)
+      return;
     const request = response.request();
-    harEntry.request.headers = request.headers().map(header => ({ name: header.name, value: header.value }));
-    harEntry.request.cookies = cookiesForHar(request.headerValue('cookie'), ';');
-    harEntry.request.postData = postDataForHar(request) || undefined;
+
+    harEntry.request.postData = postDataForHar(request, this._options.content);
 
     harEntry.response = {
       status: response.status(),
       statusText: response.statusText(),
-      httpVersion: 'HTTP/1.1',
-      cookies: cookiesForHar(response.headerValue('set-cookie'), '\n'),
-      headers: response.headers().map(header => ({ name: header.name, value: header.value })),
+      httpVersion: response.httpVersion(),
+      // These are bad values that will be overwritten bellow.
+      cookies: [],
+      headers: [],
       content: {
         size: -1,
-        mimeType: response.headerValue('content-type') || 'application/octet-stream',
+        mimeType: 'x-unknown',
       },
       headersSize: -1,
       bodySize: -1,
-      redirectURL: ''
+      redirectURL: '',
+      _transferSize: -1
     };
     const timing = response.timing();
     if (pageEntry.startedDateTime.valueOf() > timing.startTime)
       pageEntry.startedDateTime = new Date(timing.startTime);
+    const dns = timing.domainLookupEnd !== -1 ? helper.millisToRoundishMillis(timing.domainLookupEnd - timing.domainLookupStart) : -1;
+    const connect = timing.connectEnd !== -1 ? helper.millisToRoundishMillis(timing.connectEnd - timing.connectStart) : -1;
+    const ssl = timing.connectEnd !== -1 ? helper.millisToRoundishMillis(timing.connectEnd - timing.secureConnectionStart) : -1;
+    const wait = timing.responseStart !== -1 ? helper.millisToRoundishMillis(timing.responseStart - timing.requestStart) : -1;
+    const receive = response.request()._responseEndTiming !== -1 ? helper.millisToRoundishMillis(response.request()._responseEndTiming - timing.responseStart) : -1;
     harEntry.timings = {
-      dns: timing.domainLookupEnd !== -1 ? helper.millisToRoundishMillis(timing.domainLookupEnd - timing.domainLookupStart) : -1,
-      connect: timing.connectEnd !== -1 ? helper.millisToRoundishMillis(timing.connectEnd - timing.connectStart) : -1,
-      ssl: timing.connectEnd !== -1 ? helper.millisToRoundishMillis(timing.connectEnd - timing.secureConnectionStart) : -1,
+      dns,
+      connect,
+      ssl,
       send: 0,
-      wait: timing.responseStart !== -1 ? helper.millisToRoundishMillis(timing.responseStart - timing.requestStart) : -1,
-      receive: response.request()._responseEndTiming !== -1 ? helper.millisToRoundishMillis(response.request()._responseEndTiming - timing.responseStart) : -1,
+      wait,
+      receive,
     };
-    if (!this._options.omitContent && response.status() === 200) {
-      const promise = response.body().then(buffer => {
-        harEntry.response.content.text = buffer.toString('base64');
-        harEntry.response.content.encoding = 'base64';
-      }).catch(() => {});
-      this._addBarrier(page, promise);
-    }
+    harEntry.time = [dns, connect, ssl, wait, receive].reduce((pre, cur) => cur > 0 ? cur + pre : pre, 0);
+    this._addBarrier(page, response.serverAddr().then(server => {
+      if (server?.ipAddress)
+        harEntry.serverIPAddress = server.ipAddress;
+      if (server?.port)
+        harEntry._serverPort = server.port;
+    }));
+    this._addBarrier(page, response.securityDetails().then(details => {
+      if (details)
+        harEntry._securityDetails = details;
+    }));
+    this._addBarrier(page, response.rawRequestHeaders().then(headers => {
+      for (const header of headers.filter(header => header.name.toLowerCase() === 'cookie'))
+        harEntry.request.cookies.push(...header.value.split(';').map(parseCookie));
+      harEntry.request.headers = headers;
+    }));
+    this._addBarrier(page, response.rawResponseHeaders().then(headers => {
+      for (const header of headers.filter(header => header.name.toLowerCase() === 'set-cookie'))
+        harEntry.response.cookies.push(parseCookie(header.value));
+      harEntry.response.headers = headers;
+      const contentType = headers.find(header => header.name.toLowerCase() === 'content-type');
+      if (contentType)
+        harEntry.response.content.mimeType = contentType.value;
+    }));
   }
 
   async flush() {
     await Promise.all(this._barrierPromises);
-    for (const pageEntry of this._log.pages) {
+  }
+
+  stop() {
+    this._started = false;
+    eventsHelper.removeEventListeners(this._eventListeners);
+    this._barrierPromises.clear();
+
+    const log: har.Log = {
+      version: '1.2',
+      creator: {
+        name: 'Playwright',
+        version: require('../../../../package.json')['version'],
+      },
+      browser: {
+        name: this._context._browser.options.name,
+        version: this._context._browser.version()
+      },
+      pages: Array.from(this._pageEntries.values()),
+      entries: [],
+    };
+    for (const pageEntry of log.pages) {
       if (pageEntry.pageTimings.onContentLoad >= 0)
         pageEntry.pageTimings.onContentLoad -= pageEntry.startedDateTime.valueOf();
       else
@@ -235,33 +367,32 @@ class HarContextTracer {
       else
         pageEntry.pageTimings.onLoad = -1;
     }
-    await fsWriteFileAsync(this._options.path, JSON.stringify({ log: this._log }, undefined, 2));
+    this._pageEntries.clear();
+    return log;
   }
 }
 
-function postDataForHar(request: network.Request): har.PostData | null {
+function postDataForHar(request: network.Request, content: 'omit' | 'sha1' | 'embedded'): har.PostData | undefined {
   const postData = request.postDataBuffer();
   if (!postData)
-    return null;
+    return;
 
   const contentType = request.headerValue('content-type') || 'application/octet-stream';
   const result: har.PostData = {
     mimeType: contentType,
-    text: contentType === 'application/octet-stream' ? '' : postData.toString(),
+    text: '',
     params: []
   };
+
+  if (content === 'embedded' && contentType !== 'application/octet-stream')
+    result.text = postData.toString();
+
   if (contentType === 'application/x-www-form-urlencoded') {
     const parsed = new URLSearchParams(postData.toString());
     for (const [name, value] of parsed.entries())
       result.params.push({ name, value });
   }
   return result;
-}
-
-function cookiesForHar(header: string | undefined, separator: string): har.Cookie[] {
-  if (!header)
-    return [];
-  return header.split(separator).map(c => parseCookie(c));
 }
 
 function parseCookie(c: string): har.Cookie {

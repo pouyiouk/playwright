@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 
+import * as os from 'os';
 import { TimeoutSettings } from '../utils/timeoutSettings';
-import { isDebugMode, mkdirIfNeeded, createGuid } from '../utils/utils';
+import { debugMode, mkdirIfNeeded, createGuid } from '../utils/utils';
 import { Browser, BrowserOptions } from './browser';
 import { Download } from './download';
 import * as frames from './frames';
@@ -24,15 +25,25 @@ import { helper } from './helper';
 import * as network from './network';
 import { Page, PageBinding, PageDelegate } from './page';
 import { Progress } from './progress';
-import { Selectors, serverSelectors } from './selectors';
+import { Selectors } from './selectors';
 import * as types from './types';
 import path from 'path';
-import { CallMetadata, internalCallMetadata, SdkObject } from './instrumentation';
+import { CallMetadata, internalCallMetadata, createInstrumentation, SdkObject } from './instrumentation';
+import { Debugger } from './supplements/debugger';
+import { Tracing } from './trace/recorder/tracing';
+import { HarRecorder } from './supplements/har/harRecorder';
+import { RecorderSupplement } from './supplements/recorderSupplement';
+import * as consoleApiSource from '../generated/consoleApiSource';
+import { BrowserContextFetchRequest } from './fetch';
 
 export abstract class BrowserContext extends SdkObject {
   static Events = {
     Close: 'close',
     Page: 'page',
+    Request: 'request',
+    Response: 'response',
+    RequestFailed: 'requestfailed',
+    RequestFinished: 'requestfinished',
     BeforeClose: 'beforeclose',
     VideoStarted: 'videostarted',
   };
@@ -51,15 +62,24 @@ export abstract class BrowserContext extends SdkObject {
   readonly _browserContextId: string | undefined;
   private _selectors?: Selectors;
   private _origins = new Set<string>();
+  readonly _harRecorder: HarRecorder | undefined;
+  readonly tracing: Tracing;
+  readonly fetchRequest: BrowserContextFetchRequest;
 
   constructor(browser: Browser, options: types.BrowserContextOptions, browserContextId: string | undefined) {
-    super(browser);
+    super(browser, 'browser-context');
     this.attribution.context = this;
     this._browser = browser;
     this._options = options;
     this._browserContextId = browserContextId;
     this._isPersistentContext = !browserContextId;
     this._closePromise = new Promise(fulfill => this._closePromiseFulfill = fulfill);
+
+    if (this._options.recordHar)
+      this._harRecorder = new HarRecorder(this, { ...this._options.recordHar, path: path.join(this._browser.options.artifactsDir, `${createGuid()}.har`) });
+
+    this.tracing = new Tracing(this);
+    this.fetchRequest = new BrowserContextFetchRequest(this);
   }
 
   _setSelectors(selectors: Selectors) {
@@ -67,11 +87,32 @@ export abstract class BrowserContext extends SdkObject {
   }
 
   selectors(): Selectors {
-    return this._selectors || serverSelectors;
+    return this._selectors || this._browser.options.selectors;
   }
 
   async _initialize() {
-    await this.instrumentation.onContextCreated(this);
+    if (this.attribution.isInternal)
+      return;
+    // Create instrumentation per context.
+    this.instrumentation = createInstrumentation();
+
+    // Debugger will pause execution upon page.pause in headed mode.
+    const contextDebugger = new Debugger(this);
+    this.instrumentation.addListener(contextDebugger);
+
+    // When PWDEBUG=1, show inspector for each context.
+    if (debugMode() === 'inspector')
+      await RecorderSupplement.show(this, { pauseOnNextStatement: true });
+
+    // When paused, show inspector.
+    if (contextDebugger.isPaused())
+      RecorderSupplement.showInspector(this);
+    contextDebugger.on(Debugger.Events.PausedStateChanged, () => {
+      RecorderSupplement.showInspector(this);
+    });
+
+    if (debugMode() === 'console')
+      await this.extendInjectedScript(consoleApiSource.source);
   }
 
   async _ensureVideosPath() {
@@ -94,6 +135,8 @@ export abstract class BrowserContext extends SdkObject {
     this._closedStatus = 'closed';
     this._deleteAllDownloads();
     this._downloads.clear();
+    if (this._isPersistentContext)
+      this._onClosePersistent();
     this._closePromiseFulfill!(new Error('Context closed'));
     this.emit(BrowserContext.Events.Close);
   }
@@ -114,6 +157,8 @@ export abstract class BrowserContext extends SdkObject {
   abstract _doExposeBinding(binding: PageBinding): Promise<void>;
   abstract _doUpdateRequestInterception(): Promise<void>;
   abstract _doClose(): Promise<void>;
+  abstract _onClosePersistent(): void;
+  abstract _doCancelDownload(uuid: string): Promise<void>;
 
   async cookies(urls: string | string[] | undefined = []): Promise<types.NetworkCookie[]> {
     if (urls && !Array.isArray(urls))
@@ -126,15 +171,14 @@ export abstract class BrowserContext extends SdkObject {
   }
 
   async exposeBinding(name: string, needsHandle: boolean, playwrightBinding: frames.FunctionWithSource): Promise<void> {
-    const identifier = PageBinding.identifier(name, 'main');
-    if (this._pageBindings.has(identifier))
+    if (this._pageBindings.has(name))
       throw new Error(`Function "${name}" has been already registered`);
     for (const page of this.pages()) {
-      if (page.getBinding(name, 'main'))
+      if (page.getBinding(name))
         throw new Error(`Function "${name}" has been already registered in one of the pages`);
     }
-    const binding = new PageBinding(name, playwrightBinding, needsHandle, 'main');
-    this._pageBindings.set(identifier, binding);
+    const binding = new PageBinding(name, playwrightBinding, needsHandle);
+    this._pageBindings.set(name, binding);
     await this._doExposeBinding(binding);
   }
 
@@ -231,7 +275,8 @@ export abstract class BrowserContext extends SdkObject {
       this.emit(BrowserContext.Events.BeforeClose);
       this._closedStatus = 'closing';
 
-      await this.instrumentation.onContextWillDestroy(this);
+      await this._harRecorder?.flush();
+      await this.tracing.dispose();
 
       // Cleanup.
       const promises: Promise<void>[] = [];
@@ -260,7 +305,6 @@ export abstract class BrowserContext extends SdkObject {
         await this._browser.close();
 
       // Bookkeeping.
-      await this.instrumentation.onContextDidDestroy(this);
       this._didCloseInternal();
     }
     await this._closePromise;
@@ -281,7 +325,7 @@ export abstract class BrowserContext extends SdkObject {
     this._origins.add(origin);
   }
 
-  async storageState(metadata: CallMetadata): Promise<types.StorageState> {
+  async storageState(): Promise<types.StorageState> {
     const result: types.StorageState = {
       cookies: (await this.cookies()).filter(c => c.value !== ''),
       origins: []
@@ -373,11 +417,11 @@ export function validateBrowserContextOptions(options: types.BrowserContextOptio
     options.recordVideo.size!.height &= ~1;
   }
   if (options.proxy) {
-    if (!browserOptions.proxy)
-      throw new Error(`Browser needs to be launched with the global proxy. If all contexts override the proxy, global proxy will be never used and can be any string, for example "launch({ proxy: { server: 'per-context' } })"`);
+    if (!browserOptions.proxy && browserOptions.isChromium && os.platform() === 'win32')
+      throw new Error(`Browser needs to be launched with the global proxy. If all contexts override the proxy, global proxy will be never used and can be any string, for example "launch({ proxy: { server: 'http://per-context' } })"`);
     options.proxy = normalizeProxySettings(options.proxy);
   }
-  if (isDebugMode())
+  if (debugMode() === 'inspector')
     options.bypassCSP = true;
   verifyGeolocation(options.geolocation);
   if (!options._debugName)

@@ -14,59 +14,88 @@
  * limitations under the License.
  */
 
-import { ActionEntry } from '../../../server/trace/viewer/traceModel';
 import { Size } from '../geometry';
 import './snapshotTab.css';
+import './tabbedPane.css';
 import * as React from 'react';
 import { useMeasure } from './helpers';
-import type { Point } from '../../../common/types';
+import { ActionTraceEvent } from '../../../server/trace/common/traceEvents';
 
 export const SnapshotTab: React.FunctionComponent<{
-  actionEntry: ActionEntry | undefined,
-  snapshotSize: Size,
-}> = ({ actionEntry, snapshotSize }) => {
+  action: ActionTraceEvent | undefined,
+  defaultSnapshotSize: Size,
+}> = ({ action, defaultSnapshotSize }) => {
   const [measure, ref] = useMeasure<HTMLDivElement>();
   const [snapshotIndex, setSnapshotIndex] = React.useState(0);
 
-  const snapshots = actionEntry ? (actionEntry.snapshots || []) : [];
+  const snapshotMap = new Map<string, { title: string, snapshotName: string }>();
+  for (const snapshot of action?.metadata.snapshots || [])
+    snapshotMap.set(snapshot.title, snapshot);
+  const actionSnapshot = snapshotMap.get('action') || snapshotMap.get('after');
+  const snapshots = [actionSnapshot ? { ...actionSnapshot, title: 'action' } : undefined, snapshotMap.get('before'), snapshotMap.get('after')].filter(Boolean) as { title: string, snapshotName: string }[];
 
-  const iframeRef = React.createRef<HTMLIFrameElement>();
-  React.useEffect(() => {
-    if (!iframeRef.current)
-      return;
-    let snapshotUri = undefined;
-    let point: Point | undefined = undefined;
-    if (actionEntry) {
-      const snapshot = snapshots[snapshotIndex];
-      if (snapshot && snapshot.snapshotName) {
-        snapshotUri = `${actionEntry.metadata.pageId}?name=${snapshot.snapshotName}`;
-        if (snapshot.snapshotName.includes('action'))
-          point = actionEntry.metadata.point;
+  let snapshotUrl = 'data:text/html,<body style="background: #ddd"></body>';
+  let snapshotSizeUrl: string | undefined;
+  let pointX: number | undefined;
+  let pointY: number | undefined;
+  if (action) {
+    const snapshot = snapshots[snapshotIndex];
+    if (snapshot && snapshot.snapshotName) {
+      snapshotUrl = `${window.location.origin}/snapshot/${action.metadata.pageId}?name=${snapshot.snapshotName}`;
+      snapshotSizeUrl = `${window.location.origin}/snapshotSize/${action.metadata.pageId}?name=${snapshot.snapshotName}`;
+      if (snapshot.snapshotName.includes('action')) {
+        pointX = action.metadata.point?.x;
+        pointY = action.metadata.point?.y;
       }
     }
-    const snapshotUrl = snapshotUri ? `${window.location.origin}/snapshot/${snapshotUri}` : 'data:text/html,<body style="background: #ddd"></body>';
-    try {
-      (iframeRef.current.contentWindow as any).showSnapshot(snapshotUrl, { point });
-    } catch (e) {
-    }
-  }, [actionEntry, snapshotIndex]);
+  }
+
+  React.useEffect(() => {
+    if (snapshots.length >= 1 && snapshotIndex >= snapshots.length)
+      setSnapshotIndex(snapshots.length - 1);
+  }, [snapshotIndex, snapshots]);
+
+  const iframeRef = React.useRef<HTMLIFrameElement>(null);
+  const [snapshotSize, setSnapshotSize] = React.useState(defaultSnapshotSize);
+  React.useEffect(() => {
+    (async () => {
+      if (snapshotSizeUrl) {
+        const response = await fetch(snapshotSizeUrl);
+        setSnapshotSize(await response.json());
+      }
+      if (!iframeRef.current)
+        return;
+      try {
+        const point = pointX === undefined ? undefined : { x: pointX, y: pointY };
+        (iframeRef.current.contentWindow as any).showSnapshot(snapshotUrl, { point });
+      } catch (e) {
+      }
+    })();
+  }, [iframeRef, snapshotUrl, snapshotSizeUrl, pointX, pointY]);
 
   const scale = Math.min(measure.width / snapshotSize.width, measure.height / snapshotSize.height);
   const scaledSize = {
     width: snapshotSize.width * scale,
     height: snapshotSize.height * scale,
   };
-  return <div className='snapshot-tab'>
-    <div className='snapshot-controls'>
+  return <div
+    className='snapshot-tab'
+    tabIndex={0}
+    onKeyDown={event => {
+      if (event.key === 'ArrowRight')
+        setSnapshotIndex(Math.min(snapshotIndex + 1, snapshots.length - 1));
+      if (event.key === 'ArrowLeft')
+        setSnapshotIndex(Math.max(snapshotIndex - 1, 0));
+    }}
+  ><div className='tab-strip'>
       {snapshots.map((snapshot, index) => {
-        return <div
-          key={snapshot.title}
-          className={'snapshot-toggle' + (snapshotIndex === index ? ' toggled' : '')}
-          onClick={() => setSnapshotIndex(index)}>
-          {snapshot.title}
-        </div>
-      })
-    }</div>
+        return <div className={'tab-element ' + (snapshotIndex === index ? ' selected' : '')}
+          onClick={() => setSnapshotIndex(index)}
+          key={snapshot.title}>
+          <div className='tab-label'>{renderTitle(snapshot.title)}</div>
+        </div>;
+      })}
+    </div>
     <div ref={ref} className='snapshot-wrapper'>
       <div className='snapshot-container' style={{
         width: snapshotSize.width + 'px',
@@ -78,3 +107,13 @@ export const SnapshotTab: React.FunctionComponent<{
     </div>
   </div>;
 };
+
+function renderTitle(snapshotTitle: string): string {
+  if (snapshotTitle === 'before')
+    return 'Before';
+  if (snapshotTitle === 'after')
+    return 'After';
+  if (snapshotTitle === 'action')
+    return 'Action';
+  return snapshotTitle;
+}

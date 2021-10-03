@@ -3,12 +3,12 @@ set -e
 set +x
 
 trap "cd $(pwd -P)" EXIT
-cd "$(dirname $0)"
+cd "$(dirname "$0")"
 SCRIPT_PATH=$(pwd -P)
 
 main() {
   if [[ ("$1" == "-h") || ("$1" == "--help") ]]; then
-    echo "usage: $(basename $0) [output-absolute-path]"
+    echo "usage: $(basename "$0") [output-absolute-path]"
     echo
     echo "Generate distributable .zip archive from ./output folder that was previously downloaded."
     echo
@@ -29,7 +29,7 @@ main() {
     echo "ERROR: path $ZIP_PATH exists; can't do anything."
     exit 1
   fi
-  if ! [[ -d $(dirname $ZIP_PATH) ]]; then
+  if ! [[ -d $(dirname "$ZIP_PATH") ]]; then
     echo "ERROR: folder for path $($ZIP_PATH) does not exist."
     exit 1
   fi
@@ -45,7 +45,7 @@ main() {
   fi
 
   cd "${SCRIPT_PATH}"
-  cp output/build.zip $ZIP_PATH
+  cp output/build.zip "$ZIP_PATH"
 }
 
 function archive_compiled_chromium() {
@@ -57,58 +57,17 @@ function archive_compiled_chromium() {
     CHROMIUM_FILES_TO_ARCHIVE=("Chromium.app")
   elif [[ $1 == "--compile-linux" ]]; then
     CHROMIUM_FOLDER_NAME="chrome-linux"
-    CHROMIUM_FILES_TO_ARCHIVE=(
-      "chrome"
-      "chrome_100_percent.pak"
-      "chrome_200_percent.pak"
-      "chrome_sandbox"
-      "chrome-wrapper"
-      "ClearKeyCdm"
-      "crashpad_handler"
-      "icudtl.dat"
-      "libEGL.so"
-      "libGLESv2.so"
-      "locales"
-      "MEIPreload"
-      "nacl_helper"
-      "nacl_helper_bootstrap"
-      "nacl_helper_nonsfi"
-      "nacl_irt_x86_64.nexe"
-      "product_logo_48.png"
-      "resources"
-      "resources.pak"
-      "swiftshader"
-      "v8_context_snapshot.bin"
-      "xdg-mime"
-      "xdg-settings"
-    )
-  elif [[ $1 == "--compile-win"* ]]; then
+    # Run python script and convert output to array.
+    IFS=$'\n' CHROMIUM_FILES_TO_ARCHIVE=($(python "${SCRIPT_PATH}/compute_files_to_archive.py" 64bit "${CR_CHECKOUT_PATH}/src/chrome/tools/build/linux/FILES.cfg"))
+    unset IFS
+  elif [[ $1 == "--compile-win32" ]]; then
     CHROMIUM_FOLDER_NAME="chrome-win"
-    CHROMIUM_FILES_TO_ARCHIVE=(
-      "chrome.dll"
-      "chrome.exe"
-      "chrome_100_percent.pak"
-      "chrome_200_percent.pak"
-      "chrome_elf.dll"
-      "chrome_proxy.exe"
-      "chrome_pwa_launcher.exe"
-      "D3DCompiler_47.dll"
-      "elevation_service.exe"
-      "eventlog_provider.dll"
-      "First Run"
-      "icudtl.dat"
-      "libEGL.dll"
-      "libGLESv2.dll"
-      "locales"
-      "MEIPreload"
-      "mojo_core.dll"
-      "nacl_irt_x86_64.nexe"
-      "notification_helper.exe"
-      "resources.pak"
-      "swiftshader/libEGL.dll"
-      "swiftshader/libGLESv2.dll"
-      "v8_context_snapshot.bin"
-    )
+    IFS=$'\n\r' CHROMIUM_FILES_TO_ARCHIVE=($(python "${SCRIPT_PATH}/compute_files_to_archive.py" 32bit "${CR_CHECKOUT_PATH}/src/chrome/tools/build/win/FILES.cfg"))
+    unset IFS
+  elif [[ $1 == "--compile-win64" ]]; then
+    CHROMIUM_FOLDER_NAME="chrome-win"
+    IFS=$'\n\r' CHROMIUM_FILES_TO_ARCHIVE=($(python "${SCRIPT_PATH}/compute_files_to_archive.py" 64bit "${CR_CHECKOUT_PATH}/src/chrome/tools/build/win/FILES.cfg"))
+    unset IFS
   else
     echo "ERROR: unknown command, use --help for details"
     exit 1

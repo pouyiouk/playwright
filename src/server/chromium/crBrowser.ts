@@ -20,6 +20,7 @@ import { assertBrowserContextIsNotOwned, BrowserContext, validateBrowserContextO
 import { assert } from '../../utils/utils';
 import * as network from '../network';
 import { Page, PageBinding, PageDelegate, Worker } from '../page';
+import { Frame } from '../frames';
 import { ConnectionTransport } from '../transport';
 import * as types from '../types';
 import { ConnectionEvents, CRConnection, CRSession } from './crConnection';
@@ -44,6 +45,7 @@ export class CRBrowser extends Browser {
   private _tracingRecording = false;
   private _tracingPath: string | null = '';
   private _tracingClient: CRSession | undefined;
+  private _userAgent: string = '';
 
   static async connect(transport: ConnectionTransport, options: BrowserOptions, devtools?: CRDevTools): Promise<CRBrowser> {
     const connection = new CRConnection(transport, options.protocolLogger, options.browserLogsCollector);
@@ -56,17 +58,22 @@ export class CRBrowser extends Browser {
     const version = await session.send('Browser.getVersion');
     browser._isMac = version.userAgent.includes('Macintosh');
     browser._version = version.product.substring(version.product.indexOf('/') + 1);
+    browser._userAgent = version.userAgent;
     if (!options.persistent) {
       await session.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
       return browser;
     }
     browser._defaultContext = new CRBrowserContext(browser, undefined, options.persistent);
-
     await Promise.all([
-      session.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }),
+      session.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }).then(async () => {
+        // Target.setAutoAttach has a bug where it does not wait for new Targets being attached.
+        // However making a dummy call afterwards fixes this.
+        // This can be removed after https://chromium-review.googlesource.com/c/chromium/src/+/2885888 lands in stable.
+        await session.send('Target.getTargetInfo');
+      }),
       (browser._defaultContext as CRBrowserContext)._initialize(),
     ]);
-
+    await browser._waitForAllPagesToBeInitialized();
     return browser;
   }
 
@@ -77,6 +84,8 @@ export class CRBrowser extends Browser {
     this._connection.on(ConnectionEvents.Disconnected, () => this._didClose());
     this._session.on('Target.attachedToTarget', this._onAttachedToTarget.bind(this));
     this._session.on('Target.detachedFromTarget', this._onDetachedFromTarget.bind(this));
+    this._session.on('Browser.downloadWillBegin', this._onDownloadWillBegin.bind(this));
+    this._session.on('Browser.downloadProgress', this._onDownloadProgress.bind(this));
   }
 
   async newContext(options: types.BrowserContextOptions): Promise<BrowserContext> {
@@ -100,11 +109,19 @@ export class CRBrowser extends Browser {
     return this._version;
   }
 
+  userAgent(): string {
+    return this._userAgent;
+  }
+
   isClank(): boolean {
     return this.options.name === 'clank';
   }
 
-  _onAttachedToTarget({targetInfo, sessionId, waitingForDebugger}: Protocol.Target.attachedToTargetPayload) {
+  async _waitForAllPagesToBeInitialized() {
+    await Promise.all([...this._crPages.values()].map(page => page.pageOrError()));
+  }
+
+  _onAttachedToTarget({ targetInfo, sessionId, waitingForDebugger }: Protocol.Target.attachedToTargetPayload) {
     if (targetInfo.type === 'browser')
       return;
     const session = this._connection.session(sessionId)!;
@@ -178,6 +195,36 @@ export class CRBrowser extends Browser {
       serviceWorker.emit(Worker.Events.Close);
       return;
     }
+  }
+
+  private _findOwningPage(frameId: string) {
+    for (const crPage of this._crPages.values()) {
+      const frame = crPage._page._frameManager.frame(frameId);
+      if (frame)
+        return crPage;
+    }
+    return null;
+  }
+
+  _onDownloadWillBegin(payload: Protocol.Browser.downloadWillBeginPayload) {
+    const page = this._findOwningPage(payload.frameId);
+    assert(page, 'Download started in unknown page: ' + JSON.stringify(payload));
+    page.willBeginDownload();
+
+    let originPage = page._initializedPage;
+    // If it's a new window download, report it on the opener page.
+    if (!originPage && page._opener)
+      originPage = page._opener._initializedPage;
+    if (!originPage)
+      return;
+    this._downloadCreated(originPage, payload.guid, payload.url, payload.suggestedFilename);
+  }
+
+  _onDownloadProgress(payload: any) {
+    if (payload.state === 'completed')
+      this._downloadFinished(payload.guid, '');
+    if (payload.state === 'canceled')
+      this._downloadFinished(payload.guid, 'canceled');
   }
 
   async _closePage(crPage: CRPage) {
@@ -258,24 +305,24 @@ export class CRBrowserContext extends BrowserContext {
     ServiceWorker: 'serviceworker',
   };
 
-  readonly _browser: CRBrowser;
+  declare readonly _browser: CRBrowser;
   readonly _evaluateOnNewDocumentSources: string[];
 
   constructor(browser: CRBrowser, browserContextId: string | undefined, options: types.BrowserContextOptions) {
     super(browser, options, browserContextId);
-    this._browser = browser;
     this._evaluateOnNewDocumentSources = [];
     this._authenticateProxyViaCredentials();
   }
 
-  async _initialize() {
+  override async _initialize() {
     assert(!Array.from(this._browser._crPages.values()).some(page => page._browserContext === this));
     const promises: Promise<any>[] = [ super._initialize() ];
-    if (this._browser.options.downloadsPath) {
+    if (this._browser.options.name !== 'electron' && this._browser.options.name !== 'clank') {
       promises.push(this._browser._session.send('Browser.setDownloadBehavior', {
         behavior: this._options.acceptDownloads ? 'allowAndName' : 'deny',
         browserContextId: this._browserContextId,
-        downloadPath: this._browser.options.downloadsPath
+        downloadPath: this._browser.options.downloadsPath,
+        eventsEnabled: true,
       }));
     }
     if (this._options.permissions)
@@ -321,7 +368,7 @@ export class CRBrowserContext extends BrowserContext {
   async _doCookies(urls: string[]): Promise<types.NetworkCookie[]> {
     const { cookies } = await this._browser._session.send('Storage.getCookies', { browserContextId: this._browserContextId });
     return network.filterCookies(cookies.map(c => {
-      const copy: any = { sameSite: 'None', ...c };
+      const copy: any = { sameSite: 'Lax', ...c };
       delete copy.size;
       delete copy.priority;
       delete copy.session;
@@ -429,6 +476,27 @@ export class CRBrowserContext extends BrowserContext {
     }
   }
 
+  _onClosePersistent() {
+    // When persistent context is closed, we do not necessary get Target.detachedFromTarget
+    // for all the background pages.
+    for (const [targetId, backgroundPage] of this._browser._backgroundPages.entries()) {
+      if (backgroundPage._browserContext === this && backgroundPage._initializedPage) {
+        backgroundPage.didClose();
+        this._browser._backgroundPages.delete(targetId);
+      }
+    }
+  }
+
+  async _doCancelDownload(guid: string) {
+    // The upstream CDP method is implemented in a way that no explicit error would be given
+    // regarding the requested `guid`, even if the download is in a state not suitable for
+    // cancellation (finished, cancelled, etc.) or the guid is invalid at all.
+    await this._browser._session.send('Browser.cancelDownload', {
+      guid: guid,
+      browserContextId: this._browserContextId,
+    });
+  }
+
   backgroundPages(): Page[] {
     const result: Page[] = [];
     for (const backgroundPage of this._browser._backgroundPages.values()) {
@@ -442,10 +510,18 @@ export class CRBrowserContext extends BrowserContext {
     return Array.from(this._browser._serviceWorkers.values()).filter(serviceWorker => serviceWorker._browserContext === this);
   }
 
-  async newCDPSession(page: Page): Promise<CRSession> {
-    if (!(page instanceof Page))
-      throw new Error('page: expected Page');
-    const targetId = (page._delegate as CRPage)._targetId;
+  async newCDPSession(page: Page | Frame): Promise<CRSession> {
+    let targetId: string | null = null;
+    if (page instanceof Page) {
+      targetId = (page._delegate as CRPage)._targetId;
+    } else if (page instanceof Frame) {
+      const session = (page._page._delegate as CRPage)._sessions.get(page._id);
+      if (!session) throw new Error(`This frame does not have a separate CDP session, it is a part of the parent frame's session`);
+      targetId = session._targetId;
+    } else {
+      throw new Error('page: expected Page or Frame');
+    }
+
     const rootSession = await this._browser._clientRootSession();
     const { sessionId } = await rootSession.send('Target.attachToTarget', { targetId, flatten: true });
     return this._browser._connection.session(sessionId)!;

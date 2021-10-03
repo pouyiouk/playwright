@@ -14,51 +14,79 @@
  * limitations under the License.
  */
 
-import { test as it, expect } from './config/contextTest';
+import { contextTest, expect } from './config/browserTest';
 import { InMemorySnapshotter } from '../lib/server/snapshot/inMemorySnapshotter';
 import { HttpServer } from '../lib/utils/httpServer';
 import { SnapshotServer } from '../lib/server/snapshot/snapshotServer';
+import type { Frame } from '..';
+
+const it = contextTest.extend<{ snapshotPort: number, snapshotter: InMemorySnapshotter, showSnapshot: (snapshot: any) => Promise<Frame> }>({
+  snapshotPort: async ({}, run, testInfo) => {
+    await run(11000 + testInfo.workerIndex);
+  },
+
+  snapshotter: async ({ mode, toImpl, context, snapshotPort }, run, testInfo) => {
+    testInfo.skip(mode !== 'default');
+    const snapshotter = new InMemorySnapshotter(toImpl(context));
+    await snapshotter.initialize();
+    const httpServer = new HttpServer();
+    new SnapshotServer(httpServer, snapshotter);
+    await httpServer.start(snapshotPort);
+    await run(snapshotter);
+    await snapshotter.dispose();
+    await httpServer.stop();
+  },
+
+  showSnapshot: async ({ contextFactory, snapshotPort }, use) => {
+    await use(async (snapshot: any) => {
+      const previewContext = await contextFactory();
+      const previewPage = await previewContext.newPage();
+      previewPage.on('console', console.log);
+      await previewPage.goto(`http://localhost:${snapshotPort}/snapshot/`);
+      const frameSnapshot = snapshot.snapshot();
+      await previewPage.evaluate(snapshotId => {
+        (window as any).showSnapshot(snapshotId);
+      }, `${frameSnapshot.pageId}?name=${frameSnapshot.snapshotName}`);
+      // wait for the render frame to load
+      while (previewPage.frames().length < 2)
+        await new Promise(f => previewPage.once('frameattached', f));
+      const frame = previewPage.frames()[1];
+      await frame.waitForLoadState();
+      return frame;
+    });
+  },
+});
 
 it.describe('snapshots', () => {
-  let snapshotter: any;
-  let httpServer: any;
-  let snapshotPort: number;
-
-  it.beforeEach(async ({ mode, toImpl, context }, testInfo) => {
-    it.skip(mode !== 'default');
-
-    snapshotter = new InMemorySnapshotter(toImpl(context));
-    await snapshotter.initialize();
-    httpServer = new HttpServer();
-    new SnapshotServer(httpServer, snapshotter);
-    snapshotPort = 11000 + testInfo.workerIndex;
-    httpServer.start(snapshotPort);
-  });
-
-  it.afterEach(async () => {
-    await snapshotter.dispose();
-    httpServer.stop();
-  });
-
-  it('should collect snapshot', async ({ page, toImpl }) => {
+  it('should collect snapshot', async ({ page, toImpl, snapshotter }) => {
     await page.setContent('<button>Hello</button>');
     const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'snapshot');
     expect(distillSnapshot(snapshot)).toBe('<BUTTON>Hello</BUTTON>');
   });
 
-  it('should capture resources', async ({ page, toImpl, server }) => {
+  it('should preserve BASE and other content on reset', async ({ page, toImpl, snapshotter, server }) => {
+    await page.goto(server.EMPTY_PAGE);
+    const snapshot1 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+    const html1 = snapshot1.render().html;
+    expect(html1).toContain(`<BASE href="${server.EMPTY_PAGE}"`);
+    await snapshotter.reset();
+    const snapshot2 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot2');
+    const html2 = snapshot2.render().html;
+    expect(html2.replace(`"snapshot2"`, `"snapshot1"`)).toEqual(html1);
+  });
+
+  it('should capture resources', async ({ page, toImpl, server, snapshotter }) => {
     await page.goto(server.EMPTY_PAGE);
     await page.route('**/style.css', route => {
       route.fulfill({ body: 'button { color: red; }', }).catch(() => {});
     });
     await page.setContent('<link rel="stylesheet" href="style.css"><button>Hello</button>');
     const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'snapshot');
-    const { resources } = snapshot.render();
-    const cssHref = `http://localhost:${server.PORT}/style.css`;
-    expect(resources[cssHref]).toBeTruthy();
+    const resource = snapshot.resourceByUrl(`http://localhost:${server.PORT}/style.css`);
+    expect(resource).toBeTruthy();
   });
 
-  it('should collect multiple', async ({ page, toImpl }) => {
+  it('should collect multiple', async ({ page, toImpl, snapshotter }) => {
     await page.setContent('<button>Hello</button>');
     const snapshots = [];
     snapshotter.on('snapshot', snapshot => snapshots.push(snapshot));
@@ -67,68 +95,61 @@ it.describe('snapshots', () => {
     expect(snapshots.length).toBe(2);
   });
 
-  it('should only collect on change', async ({ page }) => {
-    await page.setContent('<button>Hello</button>');
-    const snapshots = [];
-    snapshotter.on('snapshot', snapshot => snapshots.push(snapshot));
-    await Promise.all([
-      new Promise(f => snapshotter.once('snapshot', f)),
-      snapshotter.setAutoSnapshotIntervalForTest(25),
-    ]);
-    await Promise.all([
-      new Promise(f => snapshotter.once('snapshot', f)),
-      page.setContent('<button>Hello 2</button>')
-    ]);
-    expect(snapshots.length).toBe(2);
-  });
-
-  it('should respect inline CSSOM change', async ({ page }) => {
+  it('should respect inline CSSOM change', async ({ page, toImpl, snapshotter }) => {
     await page.setContent('<style>button { color: red; }</style><button>Hello</button>');
-    const snapshots = [];
-    snapshotter.on('snapshot', snapshot => snapshots.push(snapshot));
-    await Promise.all([
-      new Promise(f => snapshotter.once('snapshot', f)),
-      snapshotter.setAutoSnapshotIntervalForTest(25),
-    ]);
-    expect(distillSnapshot(snapshots[0])).toBe('<style>button { color: red; }</style><BUTTON>Hello</BUTTON>');
+    const snapshot1 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+    expect(distillSnapshot(snapshot1)).toBe('<style>button { color: red; }</style><BUTTON>Hello</BUTTON>');
 
-    await Promise.all([
-      new Promise(f => snapshotter.once('snapshot', f)),
-      page.evaluate(() => {
-        (document.styleSheets[0].cssRules[0] as any).style.color = 'blue';
-      })
-    ]);
-    expect(distillSnapshot(snapshots[1])).toBe('<style>button { color: blue; }</style><BUTTON>Hello</BUTTON>');
+    await page.evaluate(() => { (document.styleSheets[0].cssRules[0] as any).style.color = 'blue'; });
+    const snapshot2 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot2');
+    expect(distillSnapshot(snapshot2)).toBe('<style>button { color: blue; }</style><BUTTON>Hello</BUTTON>');
   });
 
-  it('should respect subresource CSSOM change', async ({ page, server }) => {
+  it('should respect node removal', async ({ page, toImpl, snapshotter }) => {
+    page.on('console', console.log);
+    await page.setContent('<div><button id="button1"></button><button id="button2"></button></div>');
+    const snapshot1 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+    expect(distillSnapshot(snapshot1)).toBe('<DIV><BUTTON id=\"button1\"></BUTTON><BUTTON id=\"button2\"></BUTTON></DIV>');
+    await page.evaluate(() => document.getElementById('button2').remove());
+    const snapshot2 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot2');
+    expect(distillSnapshot(snapshot2)).toBe('<DIV><BUTTON id=\"button1\"></BUTTON></DIV>');
+  });
+
+  it('should respect attr removal', async ({ page, toImpl, snapshotter }) => {
+    page.on('console', console.log);
+    await page.setContent('<div id="div" attr1="1" attr2="2"></div>');
+    const snapshot1 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+    expect(distillSnapshot(snapshot1)).toBe('<DIV id=\"div\" attr1=\"1\" attr2=\"2\"></DIV>');
+    await page.evaluate(() => document.getElementById('div').removeAttribute('attr2'));
+    const snapshot2 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot2');
+    expect(distillSnapshot(snapshot2)).toBe('<DIV id=\"div\" attr1=\"1\"></DIV>');
+  });
+
+  it('should have a custom doctype', async ({ page, server, toImpl, snapshotter }) => {
+    await page.goto(server.EMPTY_PAGE);
+    await page.setContent('<!DOCTYPE foo><body>hi</body>');
+
+    const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'snapshot');
+    expect(distillSnapshot(snapshot)).toBe('<!DOCTYPE foo>hi');
+  });
+
+  it('should respect subresource CSSOM change', async ({ page, server, toImpl, snapshotter }) => {
     await page.goto(server.EMPTY_PAGE);
     await page.route('**/style.css', route => {
       route.fulfill({ body: 'button { color: red; }', }).catch(() => {});
     });
     await page.setContent('<link rel="stylesheet" href="style.css"><button>Hello</button>');
 
-    const snapshots = [];
-    snapshotter.on('snapshot', snapshot => snapshots.push(snapshot));
-    await Promise.all([
-      new Promise(f => snapshotter.once('snapshot', f)),
-      snapshotter.setAutoSnapshotIntervalForTest(25),
-    ]);
-    expect(distillSnapshot(snapshots[0])).toBe('<LINK rel=\"stylesheet\" href=\"style.css\"><BUTTON>Hello</BUTTON>');
+    const snapshot1 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+    expect(distillSnapshot(snapshot1)).toBe('<LINK rel=\"stylesheet\" href=\"style.css\"><BUTTON>Hello</BUTTON>');
 
-    await Promise.all([
-      new Promise(f => snapshotter.once('snapshot', f)),
-      page.evaluate(() => {
-        (document.styleSheets[0].cssRules[0] as any).style.color = 'blue';
-      })
-    ]);
-    const { resources } = snapshots[1].render();
-    const cssHref = `http://localhost:${server.PORT}/style.css`;
-    const { sha1 } = resources[cssHref];
-    expect(snapshotter.resourceContent(sha1).toString()).toBe('button { color: blue; }');
+    await page.evaluate(() => { (document.styleSheets[0].cssRules[0] as any).style.color = 'blue'; });
+    const snapshot2 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+    const resource = snapshot2.resourceByUrl(`http://localhost:${server.PORT}/style.css`);
+    expect(snapshotter.resourceContent(resource.response.content._sha1).toString()).toBe('button { color: blue; }');
   });
 
-  it('should capture iframe', async ({ page, contextFactory, server, toImpl, browserName }) => {
+  it('should capture iframe', async ({ page, server, toImpl, browserName, snapshotter, showSnapshot }) => {
     it.skip(browserName === 'firefox');
 
     await page.route('**/empty.html', route => {
@@ -157,19 +178,14 @@ it.describe('snapshots', () => {
     }
 
     // Render snapshot, check expectations.
-    const previewContext = await contextFactory();
-    const previewPage = await previewContext.newPage();
-    await previewPage.goto(`http://localhost:${snapshotPort}/snapshot/`);
-    await previewPage.evaluate(snapshotId => {
-      (window as any).showSnapshot(snapshotId);
-    }, `${snapshot.snapshot().pageId}?name=snapshot${counter}`);
-    while (previewPage.frames().length < 4)
-      await new Promise(f => previewPage.once('frameattached', f));
-    const button = await previewPage.frames()[3].waitForSelector('button');
+    const frame = await showSnapshot(snapshot);
+    while (frame.childFrames().length < 1)
+      await new Promise(f => frame.page().once('frameattached', f));
+    const button = await frame.childFrames()[0].waitForSelector('button');
     expect(await button.textContent()).toBe('Hello iframe');
   });
 
-  it('should capture snapshot target', async ({ page, toImpl }) => {
+  it('should capture snapshot target', async ({ page, toImpl, snapshotter }) => {
     await page.setContent('<button>Hello</button><button>World</button>');
     {
       const handle = await page.$('text=Hello');
@@ -183,7 +199,7 @@ it.describe('snapshots', () => {
     }
   });
 
-  it('should collect on attribute change', async ({ page, toImpl }) => {
+  it('should collect on attribute change', async ({ page, toImpl, snapshotter }) => {
     await page.setContent('<button>Hello</button>');
     {
       const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'snapshot');
@@ -200,6 +216,189 @@ it.describe('snapshots', () => {
       const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'snapshot2');
       expect(distillSnapshot(snapshot)).toBe('<BUTTON data="two">Hello</BUTTON>');
     }
+  });
+
+  it('should contain adopted style sheets', async ({ page, toImpl, showSnapshot, snapshotter, browserName }) => {
+    it.skip(browserName !== 'chromium', 'Constructed stylesheets are only in Chromium.');
+    await page.setContent('<button>Hello</button>');
+    await page.evaluate(() => {
+      const sheet = new CSSStyleSheet();
+      sheet.addRule('button', 'color: red');
+      (document as any).adoptedStyleSheets = [sheet];
+
+      const sheet2 = new CSSStyleSheet();
+      sheet2.addRule(':host', 'color: blue');
+
+      for (const element of [document.createElement('div'), document.createElement('span')]) {
+        const root = element.attachShadow({
+          mode: 'open'
+        });
+        root.append('foo');
+        (root as any).adoptedStyleSheets = [sheet2];
+        document.body.appendChild(element);
+      }
+    });
+    const snapshot1 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+
+    const frame = await showSnapshot(snapshot1);
+    await frame.waitForSelector('button');
+    const buttonColor = await frame.$eval('button', button => {
+      return window.getComputedStyle(button).color;
+    });
+    expect(buttonColor).toBe('rgb(255, 0, 0)');
+    const divColor = await frame.$eval('div', div => {
+      return window.getComputedStyle(div).color;
+    });
+    expect(divColor).toBe('rgb(0, 0, 255)');
+    const spanColor = await frame.$eval('span', span => {
+      return window.getComputedStyle(span).color;
+    });
+    expect(spanColor).toBe('rgb(0, 0, 255)');
+  });
+
+  it('should work with adopted style sheets and replace/replaceSync', async ({ page, toImpl, showSnapshot, snapshotter, browserName }) => {
+    it.skip(browserName !== 'chromium', 'Constructed stylesheets are only in Chromium.');
+    await page.setContent('<button>Hello</button>');
+    await page.evaluate(() => {
+      const sheet = new CSSStyleSheet();
+      sheet.addRule('button', 'color: red');
+      (document as any).adoptedStyleSheets = [sheet];
+    });
+    const snapshot1 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot1');
+    await page.evaluate(() => {
+      const [sheet] = (document as any).adoptedStyleSheets;
+      sheet.replaceSync(`button { color: blue }`);
+    });
+    const snapshot2 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot2');
+    await page.evaluate(() => {
+      const [sheet] = (document as any).adoptedStyleSheets;
+      sheet.replace(`button { color: #0F0 }`);
+    });
+    const snapshot3 = await snapshotter.captureSnapshot(toImpl(page), 'snapshot3');
+
+    {
+      const frame = await showSnapshot(snapshot1);
+      await frame.waitForSelector('button');
+      const buttonColor = await frame.$eval('button', button => {
+        return window.getComputedStyle(button).color;
+      });
+      expect(buttonColor).toBe('rgb(255, 0, 0)');
+    }
+    {
+      const frame = await showSnapshot(snapshot2);
+      await frame.waitForSelector('button');
+      const buttonColor = await frame.$eval('button', button => {
+        return window.getComputedStyle(button).color;
+      });
+      expect(buttonColor).toBe('rgb(0, 0, 255)');
+    }
+    {
+      const frame = await showSnapshot(snapshot3);
+      await frame.waitForSelector('button');
+      const buttonColor = await frame.$eval('button', button => {
+        return window.getComputedStyle(button).color;
+      });
+      expect(buttonColor).toBe('rgb(0, 255, 0)');
+    }
+  });
+
+  it('should restore scroll positions', async ({ page, showSnapshot, toImpl, snapshotter, browserName }) => {
+    it.skip(browserName === 'firefox');
+
+    await page.setContent(`
+      <style>
+        li { height: 20px; margin: 0; padding: 0; }
+        div { height: 60px; overflow-x: hidden; overflow-y: scroll; background: green; padding: 0; margin: 0; }
+      </style>
+      <div>
+        <ul>
+          <li>Item 1</li>
+          <li>Item 2</li>
+          <li>Item 3</li>
+          <li>Item 4</li>
+          <li>Item 5</li>
+          <li>Item 6</li>
+          <li>Item 7</li>
+          <li>Item 8</li>
+          <li>Item 9</li>
+          <li>Item 10</li>
+        </ul>
+      </div>
+    `);
+
+    await (await page.$('text=Item 8')).scrollIntoViewIfNeeded();
+    const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'scrolled');
+
+    // Render snapshot, check expectations.
+    const frame = await showSnapshot(snapshot);
+    const div = await frame.waitForSelector('div');
+    expect(await div.evaluate(div => div.scrollTop)).toBe(136);
+  });
+
+  it('should work with meta CSP', async ({ page, showSnapshot, toImpl, snapshotter, browserName }) => {
+    it.skip(browserName === 'firefox');
+
+    await page.setContent(`
+      <head>
+        <meta http-equiv="Content-Security-Policy" content="script-src 'none'">
+      </head>
+      <body>
+        <div>Hello</div>
+      </body>
+    `);
+    await page.$eval('div', div => {
+      const shadow = div.attachShadow({ mode: 'open' });
+      const span = document.createElement('span');
+      span.textContent = 'World';
+      shadow.appendChild(span);
+    });
+
+    const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'meta');
+
+    // Render snapshot, check expectations.
+    const frame = await showSnapshot(snapshot);
+    await frame.waitForSelector('div');
+    // Should render shadow dom with post-processing script.
+    expect(await frame.textContent('span')).toBe('World');
+  });
+
+  it('should handle multiple headers', async ({ page, server, showSnapshot, toImpl, snapshotter, browserName }) => {
+    it.skip(browserName === 'firefox');
+
+    server.setRoute('/foo.css', (req, res) => {
+      res.statusCode = 200;
+      res.setHeader('vary', ['accepts-encoding', 'accepts-encoding']);
+      res.end('body { padding: 42px }');
+    });
+
+    await page.goto(server.EMPTY_PAGE);
+    await page.setContent(`<head><link rel=stylesheet href="/foo.css"></head><body><div>Hello</div></body>`);
+    const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'snapshot');
+    const frame = await showSnapshot(snapshot);
+    await frame.waitForSelector('div');
+    const padding = await frame.$eval('body', body => window.getComputedStyle(body).paddingLeft);
+    expect(padding).toBe('42px');
+  });
+
+  it('should handle src=blob', async ({ page, server, showSnapshot, toImpl, snapshotter, browserName }) => {
+    it.skip(browserName === 'firefox');
+
+    await page.goto(server.EMPTY_PAGE);
+    await page.evaluate(async () => {
+      const dataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAASCAQAAADIvofAAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAAAmJLR0QA/4ePzL8AAAAHdElNRQfhBhAPKSstM+EuAAAAvUlEQVQY05WQIW4CYRgF599gEZgeoAKBWIfCNSmVvQMe3wv0ChhIViKwtTQEAYJwhgpISBA0JSxNIdlB7LIGTJ/8kpeZ7wW5TcT9o/QNBtvOrrWMrtg0sSGOFeELbHlCDsQ+ukeYiHNFJPHBDRKlQKVEbFkLUT3AiAxI6VGCXsWXAoQLBUl5E7HjUFwiyI4zf/wWoB3CFnxX5IeGdY8IGU/iwE9jcZrLy4pnEat+FL4hf/cbqREKo/Cf6W5zASVMeh234UtGAAAAJXRFWHRkYXRlOmNyZWF0ZQAyMDE3LTA2LTE2VDE1OjQxOjQzLTA3OjAwd1xNIQAAACV0RVh0ZGF0ZTptb2RpZnkAMjAxNy0wNi0xNlQxNTo0MTo0My0wNzowMAYB9Z0AAAAASUVORK5CYII=';
+      const blob = await fetch(dataUrl).then(res => res.blob());
+      const url = window.URL.createObjectURL(blob);
+      const img = document.createElement('img');
+      img.src = url;
+      const loaded = new Promise(f => img.onload = f);
+      document.body.appendChild(img);
+      await loaded;
+    });
+
+    const snapshot = await snapshotter.captureSnapshot(toImpl(page), 'snapshot');
+    const frame = await showSnapshot(snapshot);
+    const img = await frame.waitForSelector('img');
+    expect(await img.screenshot()).toMatchSnapshot('blob-src.png');
   });
 });
 

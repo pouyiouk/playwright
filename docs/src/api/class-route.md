@@ -30,7 +30,6 @@ Optional error code. Defaults to `failed`, could be one of the following:
 
 ## async method: Route.continue
 * langs:
-  - alias-csharp: ResumeAsync
   - alias-java: resume
   - alias-python: continue_
 
@@ -66,7 +65,7 @@ async def handle(route, request):
         "foo": "bar" # set "foo" header
         "origin": None # remove "origin" header
     }
-    await route.continue(headers=headers)
+    await route.continue_(headers=headers)
 }
 await page.route("**/*", handle)
 ```
@@ -79,9 +78,18 @@ def handle(route, request):
         "foo": "bar" # set "foo" header
         "origin": None # remove "origin" header
     }
-    route.continue(headers=headers)
+    route.continue_(headers=headers)
 }
 page.route("**/*", handle)
+```
+
+```csharp
+await page.RouteAsync("**/*", route =>
+{
+    var headers = new Dictionary<string, string>(route.Request.Headers) { { "foo", "bar" } };
+    headers.Remove("origin");
+    route.ContinueAsync(headers);
+});
 ```
 
 ### option: Route.continue.url
@@ -143,6 +151,13 @@ page.route("**/*", lambda route: route.fulfill(
     body="not found!"))
 ```
 
+```csharp
+await page.RouteAsync("**/*", route => route.FulfillAsync(
+    status: 404,
+    contentType: "text/plain", 
+    body: "Not Found!"));
+```
+
 An example of serving static file:
 
 ```js
@@ -151,7 +166,7 @@ await page.route('**/xhr_endpoint', route => route.fulfill({ path: 'mock_data.js
 
 ```java
 page.route("**/xhr_endpoint", route -> route.fulfill(
-  new Route.FulfillOptions().setPath(Paths.get("mock_data.json")));
+  new Route.FulfillOptions().setPath(Paths.get("mock_data.json"))));
 ```
 
 ```python async
@@ -160,6 +175,10 @@ await page.route("**/xhr_endpoint", lambda route: route.fulfill(path="mock_data.
 
 ```python sync
 page.route("**/xhr_endpoint", lambda route: route.fulfill(path="mock_data.json"))
+```
+
+```csharp
+await page.RouteAsync("**/xhr_endpoint", route => route.FulfillAsync(new RouteFulfillOptions { Path = "mock_data.json" }));
 ```
 
 ### option: Route.fulfill.status
@@ -200,6 +219,12 @@ Optional response body as raw bytes.
 
 File path to respond with. The content type will be inferred from file extension. If `path` is a relative path, then it
 is resolved relative to the current working directory.
+
+### option: Route.fulfill.response
+* langs: js
+- `response` <[FetchResponse]>
+
+[FetchResponse] to fulfill route's request with. Individual fields of the response (such as headers) can be overridden using fulfill options.
 
 ## method: Route.request
 - returns: <[Request]>

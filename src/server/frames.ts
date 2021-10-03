@@ -15,19 +15,24 @@
  * limitations under the License.
  */
 
+import * as channels from '../protocol/channels';
 import { ConsoleMessage } from './console';
 import * as dom from './dom';
-import { helper, RegisteredListener } from './helper';
+import { helper } from './helper';
+import { eventsHelper, RegisteredListener } from '../utils/eventsHelper';
 import * as js from './javascript';
 import * as network from './network';
 import { Page } from './page';
 import * as types from './types';
 import { BrowserContext } from './browserContext';
 import { Progress, ProgressController } from './progress';
-import { assert, createGuid, makeWaitForNextTask } from '../utils/utils';
+import { assert, constructURLBasedOnBaseURL, makeWaitForNextTask } from '../utils/utils';
+import { ManualPromise } from '../utils/async';
 import { debugLogger } from '../utils/debugLogger';
 import { CallMetadata, internalCallMetadata, SdkObject } from './instrumentation';
-import { ElementStateWithoutStable } from './injected/injectedScript';
+import type InjectedScript from './injected/injectedScript';
+import type { ElementStateWithoutStable, FrameExpectParams, InjectedScriptPoll, InjectedScriptProgress } from './injected/injectedScript';
+import { isSessionClosedError } from './common/protocolError';
 
 type ContextData = {
   contextPromise: Promise<dom.FrameExecutionContext>;
@@ -64,6 +69,9 @@ export type NavigationEvent = {
   error?: Error,
 };
 
+export type SchedulableTask<T> = (injectedScript: js.JSHandle<InjectedScript>) => Promise<js.JSHandle<InjectedScriptPoll<T>>>;
+export type DomTaskBody<T, R, E> = (progress: InjectedScriptProgress, element: E, data: T, elements: Element[], continuePolling: any) => R;
+
 export class FrameManager {
   private _page: Page;
   private _frames = new Map<string, Frame>();
@@ -71,6 +79,7 @@ export class FrameManager {
   readonly _consoleMessageTags = new Map<string, ConsoleTagHandler>();
   readonly _signalBarriers = new Set<SignalBarrier>();
   private _webSockets = new Map<string, network.WebSocket>();
+  _dialogCounter = 0;
 
   constructor(page: Page) {
     this._page = page;
@@ -132,11 +141,8 @@ export class FrameManager {
     if (progress)
       progress.cleanupWhenAborted(() => this._signalBarriers.delete(barrier));
     const result = await action();
-    if (source === 'input') {
+    if (source === 'input')
       await this._page._delegate.inputActionEpilogue();
-      if (progress)
-        await progress.afterInputAction();
-    }
     await barrier.waitFor();
     this._signalBarriers.delete(barrier);
     // Resolve in the next task, after all waitForNavigations.
@@ -160,11 +166,11 @@ export class FrameManager {
       return;
     for (const barrier of this._signalBarriers)
       barrier.addFrameNavigation(frame);
-    if (frame._pendingDocument && frame._pendingDocument.documentId === documentId) {
+    if (frame.pendingDocument() && frame.pendingDocument()!.documentId === documentId) {
       // Do not override request with undefined.
       return;
     }
-    frame._pendingDocument = { documentId, request: undefined };
+    frame.setPendingDocument({ documentId, request: undefined });
   }
 
   frameCommittedNewDocumentNavigation(frameId: string, url: string, name: string, documentId: string, initial: boolean) {
@@ -175,24 +181,25 @@ export class FrameManager {
     frame._name = name;
 
     let keepPending: DocumentInfo | undefined;
-    if (frame._pendingDocument) {
-      if (frame._pendingDocument.documentId === undefined) {
+    const pendingDocument = frame.pendingDocument();
+    if (pendingDocument) {
+      if (pendingDocument.documentId === undefined) {
         // Pending with unknown documentId - assume it is the one being committed.
-        frame._pendingDocument.documentId = documentId;
+        pendingDocument.documentId = documentId;
       }
-      if (frame._pendingDocument.documentId === documentId) {
+      if (pendingDocument.documentId === documentId) {
         // Committing a pending document.
-        frame._currentDocument = frame._pendingDocument;
+        frame._currentDocument = pendingDocument;
       } else {
         // Sometimes, we already have a new pending when the old one commits.
         // An example would be Chromium error page followed by a new navigation request,
         // where the error page commit arrives after Network.requestWillBeSent for the
         // new navigation.
         // We commit, but keep the pending request since it's not done yet.
-        keepPending = frame._pendingDocument;
+        keepPending = pendingDocument;
         frame._currentDocument = { documentId, request: undefined };
       }
-      frame._pendingDocument = undefined;
+      frame.setPendingDocument(undefined);
     } else {
       // No pending - just commit a new document.
       frame._currentDocument = { documentId, request: undefined };
@@ -206,7 +213,7 @@ export class FrameManager {
       this._page.frameNavigatedToNewDocument(frame);
     }
     // Restore pending if any - see comments above about keepPending.
-    frame._pendingDocument = keepPending;
+    frame.setPendingDocument(keepPending);
   }
 
   frameCommittedSameDocumentNavigation(frameId: string, url: string) {
@@ -221,17 +228,17 @@ export class FrameManager {
 
   frameAbortedNavigation(frameId: string, errorText: string, documentId?: string) {
     const frame = this._frames.get(frameId);
-    if (!frame || !frame._pendingDocument)
+    if (!frame || !frame.pendingDocument())
       return;
-    if (documentId !== undefined && frame._pendingDocument.documentId !== documentId)
+    if (documentId !== undefined && frame.pendingDocument()!.documentId !== documentId)
       return;
     const navigationEvent: NavigationEvent = {
       url: frame._url,
       name: frame._name,
-      newDocument: frame._pendingDocument,
+      newDocument: frame.pendingDocument(),
       error: new Error(errorText),
     };
-    frame._pendingDocument = undefined;
+    frame.setPendingDocument(undefined);
     frame.emit(Frame.Events.Navigation, navigationEvent);
   }
 
@@ -252,42 +259,57 @@ export class FrameManager {
       frame._onLifecycleEvent(event);
   }
 
-  requestStarted(request: network.Request) {
+  requestStarted(request: network.Request, route?: network.RouteDelegate) {
     const frame = request.frame();
     this._inflightRequestStarted(request);
     if (request._documentId)
-      frame._pendingDocument = { documentId: request._documentId, request };
+      frame.setPendingDocument({ documentId: request._documentId, request });
     if (request._isFavicon) {
-      const route = request._route();
       if (route)
-        route.continue();
+        route.continue(request, {});
       return;
     }
-    this._page._requestStarted(request);
+    this._page._browserContext.emit(BrowserContext.Events.Request, request);
+    if (route)
+      this._page._requestStarted(request, route);
   }
 
   requestReceivedResponse(response: network.Response) {
-    if (!response.request()._isFavicon)
-      this._page.emit(Page.Events.Response, response);
+    if (response.request()._isFavicon)
+      return;
+    this._page._browserContext.emit(BrowserContext.Events.Response, response);
   }
 
-  requestFinished(request: network.Request) {
+  reportRequestFinished(request: network.Request, response: network.Response | null) {
     this._inflightRequestFinished(request);
-    if (!request._isFavicon)
-      this._page.emit(Page.Events.RequestFinished, request);
+    if (request._isFavicon)
+      return;
+    this._page._browserContext.emit(BrowserContext.Events.RequestFinished, { request, response });
   }
 
   requestFailed(request: network.Request, canceled: boolean) {
     const frame = request.frame();
     this._inflightRequestFinished(request);
-    if (frame._pendingDocument && frame._pendingDocument.request === request) {
+    if (frame.pendingDocument() && frame.pendingDocument()!.request === request) {
       let errorText = request.failure()!.errorText;
       if (canceled)
         errorText += '; maybe frame was detached?';
-      this.frameAbortedNavigation(frame._id, errorText, frame._pendingDocument.documentId);
+      this.frameAbortedNavigation(frame._id, errorText, frame.pendingDocument()!.documentId);
     }
-    if (!request._isFavicon)
-      this._page.emit(Page.Events.RequestFailed, request);
+    if (request._isFavicon)
+      return;
+    this._page._browserContext.emit(BrowserContext.Events.RequestFailed, request);
+  }
+
+  dialogDidOpen() {
+    // Any ongoing evaluations will be stalled until the dialog is closed.
+    for (const frame of this._frames.values())
+      frame._invalidateNonStallingEvaluations('JavaScript dialog interrupted evaluation');
+    this._dialogCounter++;
+  }
+
+  dialogWillClose() {
+    this._dialogCounter--;
   }
 
   removeChildFramesRecursively(frame: Frame) {
@@ -398,7 +420,7 @@ export class Frame extends SdkObject {
   private _firedLifecycleEvents = new Set<types.LifecycleEvent>();
   _subtreeLifecycleEvents = new Set<types.LifecycleEvent>();
   _currentDocument: DocumentInfo;
-  _pendingDocument?: DocumentInfo;
+  private _pendingDocument: DocumentInfo | undefined;
   readonly _page: Page;
   private _parentFrame: Frame | null;
   _url = '';
@@ -411,11 +433,10 @@ export class Frame extends SdkObject {
   private _setContentCounter = 0;
   readonly _detachedPromise: Promise<void>;
   private _detachedCallback = () => {};
-  readonly uniqueId: string;
+  private _nonStallingEvaluations = new Set<(error: Error) => void>();
 
   constructor(page: Page, id: string, parentFrame: Frame | null) {
-    super(page);
-    this.uniqueId = parentFrame ? `frame@${createGuid()}` : page.uniqueId;
+    super(page, 'frame');
     this.attribution.frame = this;
     this._id = id;
     this._page = page;
@@ -450,6 +471,66 @@ export class Frame extends SdkObject {
     this._stopNetworkIdleTimer();
     if (this._inflightRequests.size === 0)
       this._startNetworkIdleTimer();
+  }
+
+  setPendingDocument(documentInfo: DocumentInfo | undefined) {
+    this._pendingDocument = documentInfo;
+    if (documentInfo)
+      this._invalidateNonStallingEvaluations('Navigation interrupted the evaluation');
+  }
+
+  pendingDocument(): DocumentInfo | undefined {
+    return this._pendingDocument;
+  }
+
+  _invalidateNonStallingEvaluations(message: string) {
+    if (!this._nonStallingEvaluations)
+      return;
+    const error = new Error(message);
+    for (const callback of this._nonStallingEvaluations)
+      callback(error);
+  }
+
+  async nonStallingRawEvaluateInExistingMainContext(expression: string): Promise<any> {
+    if (this._pendingDocument)
+      throw new Error('Frame is currently attempting a navigation');
+    if (this._page._frameManager._dialogCounter)
+      throw new Error('Open JavaScript dialog prevents evaluation');
+    const context = this._existingMainContext();
+    if (!context)
+      throw new Error('Frame does not yet have a main execution context');
+
+    let callback = () => {};
+    const frameInvalidated = new Promise<void>((f, r) => callback = r);
+    this._nonStallingEvaluations.add(callback);
+    try {
+      return await Promise.race([
+        context.rawEvaluateJSON(expression),
+        frameInvalidated
+      ]);
+    } finally {
+      this._nonStallingEvaluations.delete(callback);
+    }
+  }
+
+  async nonStallingEvaluateInExistingContext(expression: string, isFunction: boolean|undefined, world: types.World): Promise<any> {
+    if (this._pendingDocument)
+      throw new Error('Frame is currently attempting a navigation');
+    const context = this._contextData.get(world)?.context;
+    if (!context)
+      throw new Error('Frame does not yet have the execution context');
+
+    let callback = () => {};
+    const frameInvalidated = new Promise<void>((f, r) => callback = r);
+    this._nonStallingEvaluations.add(callback);
+    try {
+      return await Promise.race([
+        context.evaluateExpression(expression, isFunction),
+        frameInvalidated
+      ]);
+    } finally {
+      this._nonStallingEvaluations.delete(callback);
+    }
   }
 
   private _recalculateLifecycle() {
@@ -493,8 +574,9 @@ export class Frame extends SdkObject {
   }
 
   async goto(metadata: CallMetadata, url: string, options: types.GotoOptions = {}): Promise<network.Response | null> {
+    const constructedNavigationURL = constructURLBasedOnBaseURL(this._page._browserContext._options.baseURL, url);
     const controller = new ProgressController(metadata, this);
-    return controller.run(progress => this._goto(progress, url, options), this._page._timeoutSettings.navigationTimeout(options));
+    return controller.run(progress => this._goto(progress, constructedNavigationURL, options), this._page._timeoutSettings.navigationTimeout(options));
   }
 
   private async _goto(progress: Progress, url: string, options: types.GotoOptions): Promise<network.Response | null> {
@@ -585,7 +667,7 @@ export class Frame extends SdkObject {
     return this._context('main');
   }
 
-  _existingMainContext(): dom.FrameExecutionContext | null {
+  private _existingMainContext(): dom.FrameExecutionContext | null {
     return this._contextData.get('main')?.context || null;
   }
 
@@ -617,11 +699,12 @@ export class Frame extends SdkObject {
     return value;
   }
 
-  async $(selector: string): Promise<dom.ElementHandle<Element> | null> {
-    return this._page.selectors._query(this, selector);
+  async querySelector(selector: string, options: types.StrictOptions): Promise<dom.ElementHandle<Element> | null> {
+    debugLogger.log('api', `    finding element using the selector "${selector}"`);
+    return this._page.selectors.query(this, selector, options);
   }
 
-  async waitForSelector(metadata: CallMetadata, selector: string, options: types.WaitForElementOptions = {}): Promise<dom.ElementHandle<Element> | null> {
+  async waitForSelector(metadata: CallMetadata, selector: string, options: types.WaitForElementOptions & { omitReturnValue?: boolean } = {}): Promise<dom.ElementHandle<Element> | null> {
     const controller = new ProgressController(metadata, this);
     if ((options as any).visibility)
       throw new Error('options.visibility is not supported, did you mean options.state?');
@@ -630,34 +713,42 @@ export class Frame extends SdkObject {
     const { state = 'visible' } = options;
     if (!['attached', 'detached', 'visible', 'hidden'].includes(state))
       throw new Error(`state: expected one of (attached|detached|visible|hidden)`);
-    const info = this._page.selectors._parseSelector(selector);
-    const task = dom.waitForSelectorTask(info, state);
+    const info = this._page.parseSelector(selector, options);
+    const task = dom.waitForSelectorTask(info, state, options.omitReturnValue);
     return controller.run(async progress => {
       progress.log(`waiting for selector "${selector}"${state === 'attached' ? '' : ' to be ' + state}`);
-      const result = await this._scheduleRerunnableHandleTask(progress, info.world, task);
-      if (!result.asElement()) {
-        result.dispose();
-        return null;
+      while (progress.isRunning()) {
+        const result = await this._scheduleRerunnableHandleTask(progress, info.world, task);
+        if (!result.asElement()) {
+          result.dispose();
+          return null;
+        }
+        if ((options as any).__testHookBeforeAdoptNode)
+          await (options as any).__testHookBeforeAdoptNode();
+        try {
+          const handle = result.asElement() as dom.ElementHandle<Element>;
+          const adopted = await handle._adoptTo(await this._mainContext());
+          return adopted;
+        } catch (e) {
+          // Navigated while trying to adopt the node.
+          if (js.isJavaScriptErrorInEvaluate(e))
+            throw e;
+          result.dispose();
+        }
       }
-      const handle = result.asElement() as dom.ElementHandle<Element>;
-      return handle._adoptTo(await this._mainContext());
+      return null;
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async dispatchEvent(metadata: CallMetadata, selector: string, type: string, eventInit?: Object, options: types.TimeoutOptions = {}): Promise<void> {
-    const controller = new ProgressController(metadata, this);
-    const info = this._page.selectors._parseSelector(selector);
-    const task = dom.dispatchEventTask(info, type, eventInit || {});
-    await controller.run(async progress => {
-      progress.log(`Dispatching "${type}" event on selector "${selector}"...`);
-      // Note: we always dispatch events in the main world.
-      await this._scheduleRerunnableTask(progress, 'main', task);
-    }, this._page._timeoutSettings.timeout(options));
+  async dispatchEvent(metadata: CallMetadata, selector: string, type: string, eventInit: Object = {}, options: types.QueryOnSelectorOptions = {}): Promise<void> {
+    await this._scheduleRerunnableTask(metadata, selector, (progress, element, data) => {
+      progress.injectedScript.dispatchEvent(element, data.type, data.eventInit);
+    }, { type, eventInit }, { mainWorld: true, ...options });
     await this._page._doSlowMo();
   }
 
-  async evalOnSelectorAndWaitForSignals(selector: string, expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
-    const handle = await this.$(selector);
+  async evalOnSelectorAndWaitForSignals(selector: string, strict: boolean, expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
+    const handle = await this.querySelector(selector, { strict });
     if (!handle)
       throw new Error(`Error: failed to find element matching selector "${selector}"`);
     const result = await handle.evaluateExpressionAndWaitForSignals(expression, isFunction, true, arg);
@@ -672,20 +763,26 @@ export class Frame extends SdkObject {
     return result;
   }
 
-  async $$(selector: string): Promise<dom.ElementHandle<Element>[]> {
+  async querySelectorAll(selector: string): Promise<dom.ElementHandle<Element>[]> {
     return this._page.selectors._queryAll(this, selector, undefined, true /* adoptToMain */);
   }
 
   async content(): Promise<string> {
-    const context = await this._utilityContext();
-    return context.evaluate(() => {
-      let retVal = '';
-      if (document.doctype)
-        retVal = new XMLSerializer().serializeToString(document.doctype);
-      if (document.documentElement)
-        retVal += document.documentElement.outerHTML;
-      return retVal;
-    });
+    try {
+      const context = await this._utilityContext();
+      return await context.evaluate(() => {
+        let retVal = '';
+        if (document.doctype)
+          retVal = new XMLSerializer().serializeToString(document.doctype);
+        if (document.documentElement)
+          retVal += document.documentElement.outerHTML;
+        return retVal;
+      });
+    } catch (e) {
+      if (js.isJavaScriptErrorInEvaluate(e) || isSessionClosedError(e))
+        throw e;
+      throw new Error(`Unable to retrieve content because the page is navigating and changing the content.`);
+    }
   }
 
   async setContent(metadata: CallMetadata, html: string, options: types.NavigateOptions = {}): Promise<void> {
@@ -829,16 +926,9 @@ export class Frame extends SdkObject {
     let result: dom.ElementHandle;
     let error: Error | undefined;
     let cspMessage: ConsoleMessage | undefined;
-    const actionPromise = new Promise<void>(async resolve => {
-      try {
-        result = await func();
-      } catch (e) {
-        error = e;
-      }
-      resolve();
-    });
+    const actionPromise = func().then(r => result = r).catch(e => error = e);
     const errorPromise = new Promise<void>(resolve => {
-      listeners.push(helper.addEventListener(this._page, Page.Events.Console, (message: ConsoleMessage) => {
+      listeners.push(eventsHelper.addEventListener(this._page, Page.Events.Console, (message: ConsoleMessage) => {
         if (message.type() === 'error' && message.text().includes('Content Security Policy')) {
           cspMessage = message;
           resolve();
@@ -846,7 +936,7 @@ export class Frame extends SdkObject {
       }));
     });
     await Promise.race([actionPromise, errorPromise]);
-    helper.removeEventListeners(listeners);
+    eventsHelper.removeEventListeners(listeners);
     if (cspMessage)
       throw new Error(cspMessage.text());
     if (error)
@@ -857,8 +947,9 @@ export class Frame extends SdkObject {
   private async _retryWithProgressIfNotConnected<R>(
     progress: Progress,
     selector: string,
+    strict: boolean | undefined,
     action: (handle: dom.ElementHandle<Element>) => Promise<R | 'error:notconnected'>): Promise<R> {
-    const info = this._page.selectors._parseSelector(selector);
+    const info = this._page.parseSelector(selector, { strict });
     while (progress.isRunning()) {
       progress.log(`waiting for selector "${selector}"`);
       const task = dom.waitForSelectorTask(info, 'attached');
@@ -882,38 +973,64 @@ export class Frame extends SdkObject {
 
   private async _retryWithSelectorIfNotConnected<R>(
     controller: ProgressController,
-    selector: string, options: types.TimeoutOptions,
+    selector: string, options: types.TimeoutOptions & types.StrictOptions,
     action: (progress: Progress, handle: dom.ElementHandle<Element>) => Promise<R | 'error:notconnected'>): Promise<R> {
     return controller.run(async progress => {
-      return this._retryWithProgressIfNotConnected(progress, selector, handle => action(progress, handle));
+      return this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => action(progress, handle));
     }, this._page._timeoutSettings.timeout(options));
   }
 
   async click(metadata: CallMetadata, selector: string, options: types.MouseClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._click(progress, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._click(progress, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
   async dblclick(metadata: CallMetadata, selector: string, options: types.MouseMultiClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._dblclick(progress, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._dblclick(progress, options)));
+    }, this._page._timeoutSettings.timeout(options));
+  }
+
+  async dragAndDrop(metadata: CallMetadata, source: string, target: string,  options: types.DragActionOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
+    const controller = new ProgressController(metadata, this);
+    await controller.run(async progress => {
+      await dom.assertDone(await this._retryWithProgressIfNotConnected(progress, source, options.strict, async handle => {
+        return handle._retryPointerAction(progress, 'move and down', false, async point => {
+          await this._page.mouse.move(point.x, point.y);
+          await this._page.mouse.down();
+        }, {
+          ...options,
+          position: options.sourcePosition,
+          timeout: progress.timeUntilDeadline(),
+        });
+      }));
+      await dom.assertDone(await this._retryWithProgressIfNotConnected(progress, target, options.strict, async handle => {
+        return handle._retryPointerAction(progress, 'move and up', false, async point => {
+          await this._page.mouse.move(point.x, point.y);
+          await this._page.mouse.up();
+        }, {
+          ...options,
+          position: options.targetPosition,
+          timeout: progress.timeUntilDeadline(),
+        });
+      }));
     }, this._page._timeoutSettings.timeout(options));
   }
 
   async tap(metadata: CallMetadata, selector: string, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._tap(progress, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._tap(progress, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async fill(metadata: CallMetadata, selector: string, value: string, options: types.NavigatingActionWaitOptions) {
+  async fill(metadata: CallMetadata, selector: string, value: string, options: types.NavigatingActionWaitOptions & { force?: boolean }) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._fill(progress, value, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._fill(progress, value, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
@@ -923,137 +1040,150 @@ export class Frame extends SdkObject {
     await this._page._doSlowMo();
   }
 
-  async textContent(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<string | null> {
-    const controller = new ProgressController(metadata, this);
-    const info = this._page.selectors._parseSelector(selector);
-    const task = dom.textContentTask(info);
-    return controller.run(async progress => {
-      progress.log(`  retrieving textContent from "${selector}"`);
-      return this._scheduleRerunnableTask(progress, info.world, task);
-    }, this._page._timeoutSettings.timeout(options));
+  async textContent(metadata: CallMetadata, selector: string, options: types.QueryOnSelectorOptions = {}): Promise<string | null> {
+    return this._scheduleRerunnableTask(metadata, selector, (progress, element) => element.textContent, undefined, options);
   }
 
-  async innerText(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<string> {
-    const controller = new ProgressController(metadata, this);
-    const info = this._page.selectors._parseSelector(selector);
-    const task = dom.innerTextTask(info);
-    return controller.run(async progress => {
-      progress.log(`  retrieving innerText from "${selector}"`);
-      const result = dom.throwFatalDOMError(await this._scheduleRerunnableTask(progress, info.world, task));
-      return result.innerText;
-    }, this._page._timeoutSettings.timeout(options));
+  async innerText(metadata: CallMetadata, selector: string, options: types.QueryOnSelectorOptions = {}): Promise<string> {
+    return this._scheduleRerunnableTask(metadata, selector, (progress, element) => {
+      if (element.namespaceURI !== 'http://www.w3.org/1999/xhtml')
+        throw progress.injectedScript.createStacklessError('Node is not an HTMLElement');
+      return (element as HTMLElement).innerText;
+    }, undefined, options);
   }
 
-  async innerHTML(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<string> {
-    const controller = new ProgressController(metadata, this);
-    const info = this._page.selectors._parseSelector(selector);
-    const task = dom.innerHTMLTask(info);
-    return controller.run(async progress => {
-      progress.log(`  retrieving innerHTML from "${selector}"`);
-      return this._scheduleRerunnableTask(progress, info.world, task);
-    }, this._page._timeoutSettings.timeout(options));
+  async innerHTML(metadata: CallMetadata, selector: string, options: types.QueryOnSelectorOptions = {}): Promise<string> {
+    return this._scheduleRerunnableTask(metadata, selector, (progress, element) => element.innerHTML, undefined, options);
   }
 
-  async getAttribute(metadata: CallMetadata, selector: string, name: string, options: types.TimeoutOptions = {}): Promise<string | null> {
-    const controller = new ProgressController(metadata, this);
-    const info = this._page.selectors._parseSelector(selector);
-    const task = dom.getAttributeTask(info, name);
-    return controller.run(async progress => {
-      progress.log(`  retrieving attribute "${name}" from "${selector}"`);
-      return this._scheduleRerunnableTask(progress, info.world, task);
-    }, this._page._timeoutSettings.timeout(options));
+  async getAttribute(metadata: CallMetadata, selector: string, name: string, options: types.QueryOnSelectorOptions = {}): Promise<string | null> {
+    return this._scheduleRerunnableTask(metadata, selector, (progress, element, data) => element.getAttribute(data.name), { name }, options);
   }
 
-  private async _checkElementState(metadata: CallMetadata, selector: string, state: ElementStateWithoutStable, options: types.TimeoutOptions = {}): Promise<boolean> {
-    const controller = new ProgressController(metadata, this);
-    const info = this._page.selectors._parseSelector(selector);
-    const task = dom.elementStateTask(info, state);
-    const result = await controller.run(async progress => {
-      progress.log(`  checking "${state}" state of "${selector}"`);
-      return this._scheduleRerunnableTask(progress, info.world, task);
-    }, this._page._timeoutSettings.timeout(options));
-    return dom.throwFatalDOMError(dom.throwRetargetableDOMError(result));
+  async inputValue(metadata: CallMetadata, selector: string, options: types.TimeoutOptions & types.StrictOptions = {}): Promise<string> {
+    return this._scheduleRerunnableTask(metadata, selector, (progress, element) => {
+      if (element.nodeName !== 'INPUT' && element.nodeName !== 'TEXTAREA' && element.nodeName !== 'SELECT')
+        throw progress.injectedScript.createStacklessError('Node is not an <input>, <textarea> or <select> element');
+      return (element as any).value;
+    }, undefined, options);
   }
 
-  async isVisible(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<boolean> {
+  private async _elementState(metadata: CallMetadata, selector: string, state: ElementStateWithoutStable, options: types.QueryOnSelectorOptions = {}): Promise<boolean> {
+    const result = await this._scheduleRerunnableTask(metadata, selector, (progress, element, data) => {
+      const injected = progress.injectedScript;
+      return injected.elementState(element, data.state);
+    }, { state }, options);
+    return dom.throwRetargetableDOMError(result);
+  }
+
+  async isVisible(metadata: CallMetadata, selector: string, options: types.StrictOptions = {}): Promise<boolean> {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       progress.log(`  checking visibility of "${selector}"`);
-      const element = await this.$(selector);
+      const element = await this.querySelector(selector, options);
       return element ? await element.isVisible() : false;
-    }, this._page._timeoutSettings.timeout(options));
+    }, this._page._timeoutSettings.timeout({}));
   }
 
-  async isHidden(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<boolean> {
+  async isHidden(metadata: CallMetadata, selector: string, options: types.StrictOptions = {}): Promise<boolean> {
     return !(await this.isVisible(metadata, selector, options));
   }
 
-  async isDisabled(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<boolean> {
-    return this._checkElementState(metadata, selector, 'disabled', options);
+  async isDisabled(metadata: CallMetadata, selector: string, options: types.QueryOnSelectorOptions = {}): Promise<boolean> {
+    return this._elementState(metadata, selector, 'disabled', options);
   }
 
-  async isEnabled(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<boolean> {
-    return this._checkElementState(metadata, selector, 'enabled', options);
+  async isEnabled(metadata: CallMetadata, selector: string, options: types.QueryOnSelectorOptions = {}): Promise<boolean> {
+    return this._elementState(metadata, selector, 'enabled', options);
   }
 
-  async isEditable(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<boolean> {
-    return this._checkElementState(metadata, selector, 'editable', options);
+  async isEditable(metadata: CallMetadata, selector: string, options: types.QueryOnSelectorOptions = {}): Promise<boolean> {
+    return this._elementState(metadata, selector, 'editable', options);
   }
 
-  async isChecked(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<boolean> {
-    return this._checkElementState(metadata, selector, 'checked', options);
+  async isChecked(metadata: CallMetadata, selector: string, options: types.QueryOnSelectorOptions = {}): Promise<boolean> {
+    return this._elementState(metadata, selector, 'checked', options);
   }
 
   async hover(metadata: CallMetadata, selector: string, options: types.PointerActionOptions & types.PointerActionWaitOptions = {}) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._hover(progress, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._hover(progress, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async selectOption(metadata: CallMetadata, selector: string, elements: dom.ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions = {}): Promise<string[]> {
+  async selectOption(metadata: CallMetadata, selector: string, elements: dom.ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions & types.ForceOptions = {}): Promise<string[]> {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._selectOption(progress, elements, values, options));
+      return await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._selectOption(progress, elements, values, options));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async setInputFiles(metadata: CallMetadata, selector: string, files: types.FilePayload[], options: types.NavigatingActionWaitOptions = {}): Promise<void> {
+  async setInputFiles(metadata: CallMetadata, selector: string, files: channels.ElementHandleSetInputFilesParams['files'], options: types.NavigatingActionWaitOptions = {}): Promise<void> {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._setInputFiles(progress, files, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._setInputFiles(progress, files, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
   async type(metadata: CallMetadata, selector: string, text: string, options: { delay?: number } & types.NavigatingActionWaitOptions = {}) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._type(progress, text, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._type(progress, text, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
   async press(metadata: CallMetadata, selector: string, key: string, options: { delay?: number } & types.NavigatingActionWaitOptions = {}) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._press(progress, key, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._press(progress, key, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
   async check(metadata: CallMetadata, selector: string, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._setChecked(progress, true, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._setChecked(progress, true, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
   async uncheck(metadata: CallMetadata, selector: string, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
-      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._setChecked(progress, false, options)));
+      return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, options.strict, handle => handle._setChecked(progress, false, options)));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async _waitForFunctionExpression<R>(metadata: CallMetadata, expression: string, isFunction: boolean | undefined, arg: any, options: types.WaitForFunctionOptions = {}): Promise<js.SmartHandle<R>> {
+  async waitForTimeout(metadata: CallMetadata, timeout: number) {
+    const controller = new ProgressController(metadata, this);
+    return controller.run(async () => {
+      await new Promise(resolve => setTimeout(resolve, timeout));
+    });
+  }
+
+  async expect(metadata: CallMetadata, selector: string, options: FrameExpectParams): Promise<{ pass: boolean, received?: any, log?: string[] }> {
+    const controller = new ProgressController(metadata, this);
+    const querySelectorAll = options.expression === 'to.have.count' || options.expression.endsWith('.array');
+    const mainWorld = options.expression === 'to.have.property';
+    const omitAttached = (!options.isNot && options.expression === 'to.be.hidden') || (options.isNot && options.expression === 'to.be.visible');
+
+    return await this._scheduleRerunnableTaskWithController(controller, selector, (progress, element, options, elements, continuePolling) => {
+      // We don't have an element and we don't need an element => pass.
+      if (!element && options.omitAttached)
+        return { pass: !options.isNot };
+      // We don't have an element and we DO need an element => fail.
+      if (!element)
+        return { pass: !!options.isNot };
+      // We have an element.
+      return progress.injectedScript.expect(progress, element!, options, elements, continuePolling);
+    }, { omitAttached, ...options }, { strict: true, querySelectorAll, mainWorld, omitAttached, logScale: true, ...options }).catch(e => {
+      if (js.isJavaScriptErrorInEvaluate(e))
+        throw e;
+      return { received: controller.lastIntermediateResult(), pass: !!options.isNot, log: metadata.log };
+    });
+  }
+
+  async _waitForFunctionExpression<R>(metadata: CallMetadata, expression: string, isFunction: boolean | undefined, arg: any, options: types.WaitForFunctionOptions, world: types.World = 'main'): Promise<js.SmartHandle<R>> {
     const controller = new ProgressController(metadata, this);
     if (typeof options.pollingInterval === 'number')
       assert(options.pollingInterval > 0, 'Cannot poll with non-positive interval: ' + options.pollingInterval);
@@ -1077,19 +1207,18 @@ export class Frame extends SdkObject {
       return injectedScript.pollInterval(polling, (progress, continuePolling) => predicate(arg) || continuePolling);
     }, { expression, isFunction, polling: options.pollingInterval, arg });
     return controller.run(
-        progress => this._scheduleRerunnableHandleTask(progress, 'main', task),
+        progress => this._scheduleRerunnableHandleTask(progress, world, task),
         this._page._timeoutSettings.timeout(options));
   }
 
-  async waitForFunctionValue<R>(progress: Progress, pageFunction: js.Func1<any, R>) {
+  async waitForFunctionValueInUtility<R>(progress: Progress, pageFunction: js.Func1<any, R>) {
     const expression = `() => {
       const result = (${pageFunction})();
       if (!result)
         return result;
       return JSON.stringify(result);
-
     }`;
-    const handle = await this._page.mainFrame()._waitForFunctionExpression(internalCallMetadata(), expression, true, undefined, { timeout: progress.timeUntilDeadline() });
+    const handle = await this._waitForFunctionExpression(internalCallMetadata(), expression, true, undefined, { timeout: progress.timeUntilDeadline() }, 'utility');
     return JSON.parse(handle.rawValue()) as R;
   }
 
@@ -1111,14 +1240,51 @@ export class Frame extends SdkObject {
     this._parentFrame = null;
   }
 
-  private _scheduleRerunnableTask<T>(progress: Progress, world: types.World, task: dom.SchedulableTask<T>): Promise<T> {
-    const data = this._contextData.get(world)!;
-    const rerunnableTask = new RerunnableTask(data, progress, task, true /* returnByValue */);
-    if (this._detached)
-      rerunnableTask.terminate(new Error('waitForFunction failed: frame got detached.'));
-    if (data.context)
-      rerunnableTask.rerun(data.context);
-    return rerunnableTask.promise;
+  private async _scheduleRerunnableTask<T, R>(metadata: CallMetadata, selector: string, body: DomTaskBody<T, R, Element>, taskData: T, options: types.TimeoutOptions & types.StrictOptions & { mainWorld?: boolean } = {}): Promise<R> {
+    const controller = new ProgressController(metadata, this);
+    return this._scheduleRerunnableTaskWithController(controller, selector, body as DomTaskBody<T, R, Element | undefined>, taskData, options);
+  }
+
+  private async _scheduleRerunnableTaskWithController<T, R>(
+    controller: ProgressController,
+    selector: string,
+    body: DomTaskBody<T, R, Element | undefined>,
+    taskData: T,
+    options: types.TimeoutOptions & types.StrictOptions & { mainWorld?: boolean, querySelectorAll?: boolean, logScale?: boolean, omitAttached?: boolean } = {}): Promise<R> {
+
+    const info = this._page.parseSelector(selector, options);
+    const callbackText = body.toString();
+    const data = this._contextData.get(options.mainWorld ? 'main' : info.world)!;
+
+    return controller.run(async progress => {
+      progress.log(`waiting for selector "${selector}"`);
+      const rerunnableTask = new RerunnableTask(data, progress, injectedScript => {
+        return injectedScript.evaluateHandle((injected, { info, taskData, callbackText, querySelectorAll, logScale, omitAttached }) => {
+          const callback = injected.eval(callbackText) as DomTaskBody<T, R, Element | undefined>;
+          const poller = logScale ? injected.pollLogScale.bind(injected) : injected.pollRaf.bind(injected);
+          return poller((progress, continuePolling) => {
+            if (querySelectorAll) {
+              const elements = injected.querySelectorAll(info.parsed, document);
+              progress.logRepeating(`  selector resolved to ${elements.length} element${elements.length === 1 ? '' : 's'}`);
+              return callback(progress, elements[0], taskData as T, elements, continuePolling);
+            }
+
+            const element = injected.querySelector(info.parsed, document, info.strict);
+            if (!element && !omitAttached)
+              return continuePolling;
+            if (element)
+              progress.logRepeating(`  selector resolved to ${injected.previewNode(element)}`);
+            return callback(progress, element, taskData as T, [], continuePolling);
+          });
+        }, { info, taskData, callbackText, querySelectorAll: options.querySelectorAll, logScale: options.logScale, omitAttached: options.omitAttached });
+      }, true);
+
+      if (this._detached)
+        rerunnableTask.terminate(new Error('Frame got detached.'));
+      if (data.context)
+        rerunnableTask.rerun(data.context);
+      return await rerunnableTask.promise;
+    }, this._page._timeoutSettings.timeout(options));
   }
 
   private _scheduleRerunnableHandleTask<T>(progress: Progress, world: types.World, task: dom.SchedulableTask<T>): Promise<js.SmartHandle<T>> {
@@ -1179,9 +1345,9 @@ export class Frame extends SdkObject {
   }
 
   async extendInjectedScript(source: string, arg?: any): Promise<js.JSHandle> {
-    const mainContext = await this._mainContext();
-    const injectedScriptHandle = await mainContext.injectedScript();
-    return injectedScriptHandle.evaluateHandle((injectedScript, {source, arg}) => {
+    const context = await this._context('main');
+    const injectedScriptHandle = await context.injectedScript();
+    return injectedScriptHandle.evaluateHandle((injectedScript, { source, arg }) => {
       return injectedScript.extend(source, arg);
     }, { source, arg });
   }
@@ -1221,18 +1387,12 @@ class RerunnableTask {
       this._contextData.rerunnableTasks.delete(this);
       this._resolve(result);
     } catch (e) {
-      // When the page is navigated, the promise is rejected.
+      if (js.isJavaScriptErrorInEvaluate(e) || isSessionClosedError(e)) {
+        this._contextData.rerunnableTasks.delete(this);
+        this._reject(e);
+      }
+
       // We will try again in the new execution context.
-      if (e.message.includes('Execution context was destroyed'))
-        return;
-
-      // We could have tried to evaluate in a context which was already
-      // destroyed.
-      if (e.message.includes('Cannot find context with specified id'))
-        return;
-
-      this._contextData.rerunnableTasks.delete(this);
-      this._reject(e);
     }
   }
 }
@@ -1240,16 +1400,14 @@ class RerunnableTask {
 class SignalBarrier {
   private _progress: Progress | null;
   private _protectCount = 0;
-  private _promise: Promise<void>;
-  private _promiseCallback = () => {};
+  private _promise = new ManualPromise<void>();
 
   constructor(progress: Progress | null) {
     this._progress = progress;
-    this._promise = new Promise(f => this._promiseCallback = f);
     this.retain();
   }
 
-  waitFor(): Promise<void> {
+  waitFor(): PromiseLike<void> {
     this.release();
     return this._promise;
   }
@@ -1281,7 +1439,7 @@ class SignalBarrier {
   release() {
     --this._protectCount;
     if (!this._protectCount)
-      this._promiseCallback();
+      this._promise.resolve();
   }
 }
 

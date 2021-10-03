@@ -1,15 +1,17 @@
 const path = require('path');
 const HtmlWebPackPlugin = require('html-webpack-plugin');
 
+const mode = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+
 module.exports = {
-  mode: process.env.NODE_ENV === 'production' ? 'production' : 'development',
+  mode,
   entry: {
     app: path.join(__dirname, 'index.tsx'),
   },
   resolve: {
     extensions: ['.ts', '.js', '.tsx', '.jsx']
   },
-  devtool: 'source-map',
+  devtool: mode === 'production' ? false : 'source-map',
   output: {
     globalObject: 'self',
     filename: '[name].bundle.js',
@@ -19,7 +21,13 @@ module.exports = {
     rules: [
       {
         test: /\.(j|t)sx?$/,
-        use: 'ts-loader',
+        loader: 'babel-loader',
+        options: {
+          presets: [
+            "@babel/preset-typescript",
+            "@babel/preset-react"
+          ]
+        },
         exclude: /node_modules/
       },
       {

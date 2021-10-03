@@ -23,6 +23,7 @@ const path = require('path');
 async function checkDeps() {
   const root = path.normalize(path.join(__dirname, '..'));
   const src = path.normalize(path.join(__dirname, '..', 'src'));
+  const packageJSON = require(path.join(root, 'package.json'));
   const program = ts.createProgram({
     options: {
       allowJs: true,
@@ -44,7 +45,7 @@ async function checkDeps() {
   if (errors.length) {
     console.log(`--------------------------------------------------------`);
     console.log(`Changing the project structure or adding new components?`);
-    console.log(`Update DEPS in //${path.relative(root, __filename)}.`);
+    console.log(`Update DEPS in ./${path.relative(root, __filename)}`);
     console.log(`--------------------------------------------------------`);
   }
   process.exit(errors.length ? 1 : 0);
@@ -55,6 +56,8 @@ async function checkDeps() {
       const importPath = path.resolve(path.dirname(fileName), importName) + '.ts';
       if (!allowImport(fileName, importPath))
         errors.push(`Disallowed import from ${path.relative(root, fileName)} to ${path.relative(root, importPath)}`);
+      if (!alllowExternalImport(fileName, importPath, importName))
+        errors.push(`Disallowed external dependency ${importName} from ${path.relative(root, fileName)}`);
     }
     ts.forEachChild(node, x => visit(x, fileName));
   }
@@ -91,11 +94,38 @@ async function checkDeps() {
     }
     return false;
   }
+
+
+  function alllowExternalImport(from, importPath, importName) {
+    const EXTERNAL_IMPORT_ALLOWLIST = ['electron'];
+    // Only external imports are relevant. Files in src/web are bundled via webpack.
+    if (importName.startsWith('.') || importPath.startsWith(path.join(src, 'web')))
+      return true;
+    if (EXTERNAL_IMPORT_ALLOWLIST.includes(importName))
+      return true;
+    try {
+      const resolvedImport = require.resolve(importName)
+      const resolvedImportRelativeToNodeModules = path.relative(path.join(root, 'node_modules'), resolvedImport);
+      // Filter out internal Node.js modules
+      if (!resolvedImportRelativeToNodeModules.startsWith(importName))
+        return true;
+      const resolvedImportRelativeToNodeModulesParts = resolvedImportRelativeToNodeModules.split(path.sep);
+      if (packageJSON.dependencies[resolvedImportRelativeToNodeModulesParts[0]])
+        return true;
+      // handle e.g. @babel/code-frame
+      if (resolvedImportRelativeToNodeModulesParts.length >= 2 && packageJSON.dependencies[resolvedImportRelativeToNodeModulesParts.splice(0, 2).join(path.sep)])
+        return true;
+      return false;
+    } catch (error) {
+      if (error.code !== 'MODULE_NOT_FOUND')
+        throw error
+    }
+  }
 }
 
 function listAllFiles(dir) {
   const dirs = fs.readdirSync(dir, { withFileTypes: true });
-  const  result = [];
+  const result = [];
   dirs.map(d => {
     const res = path.resolve(dir, d.name);
     if (d.isDirectory())
@@ -109,10 +139,9 @@ function listAllFiles(dir) {
 const DEPS = {};
 
 DEPS['src/protocol/'] = ['src/utils/'];
-DEPS['src/install/'] = ['src/utils/'];
 
 // Client depends on chromium protocol for types.
-DEPS['src/client/'] = ['src/common/', 'src/utils/', 'src/protocol/', 'src/server/chromium/protocol.ts'];
+DEPS['src/client/'] = ['src/common/', 'src/utils/', 'src/protocol/', 'src/server/chromium/protocol.d.ts'];
 DEPS['src/outofprocess.ts'] = ['src/client/', 'src/protocol/'];
 
 DEPS['src/dispatchers/'] = ['src/common/', 'src/utils/', 'src/protocol/', 'src/server/**'];
@@ -134,34 +163,44 @@ DEPS['src/server/'] = [
 // No dependencies for code shared between node and page.
 DEPS['src/server/common/'] = [];
 // Strict dependencies for injected code.
-DEPS['src/server/injected/'] = ['src/server/common/'];
+DEPS['src/server/injected/'] = ['src/server/common/', 'src/protocol/channels.ts'];
 
 // Electron and Clank use chromium internally.
 DEPS['src/server/android/'] = [...DEPS['src/server/'], 'src/server/chromium/', 'src/protocol/'];
 DEPS['src/server/electron/'] = [...DEPS['src/server/'], 'src/server/chromium/'];
 
-DEPS['src/server/playwright.ts'] = [...DEPS['src/server/'], 'src/server/trace/recorder/tracer.ts', 'src/server/chromium/', 'src/server/webkit/', 'src/server/firefox/', 'src/server/android/', 'src/server/electron/'];
-DEPS['src/cli/driver.ts'] = DEPS['src/inprocess.ts'] = DEPS['src/browserServerImpl.ts'] = ['src/**'];
+DEPS['src/server/playwright.ts'] = [...DEPS['src/server/'], 'src/server/chromium/', 'src/server/webkit/', 'src/server/firefox/', 'src/server/android/', 'src/server/electron/'];
+DEPS['src/server/browserContext.ts'] = [...DEPS['src/server/'], 'src/server/trace/recorder/tracing.ts'];
+DEPS['src/cli/driver.ts'] = DEPS['src/inProcessFactory.ts'] = DEPS['src/browserServerImpl.ts'] = ['src/**'];
 
 // Tracing is a client/server plugin, nothing should depend on it.
 DEPS['src/web/recorder/'] = ['src/common/', 'src/web/', 'src/web/components/', 'src/server/supplements/recorder/recorderTypes.ts'];
 DEPS['src/web/traceViewer/'] = ['src/common/', 'src/web/'];
-DEPS['src/web/traceViewer/ui/'] = ['src/common/', 'src/web/traceViewer/', 'src/web/', 'src/server/trace/viewer/', 'src/server/trace/', 'src/server/trace/common/', 'src/server/snapshot/snapshotTypes.ts'];
+DEPS['src/web/traceViewer/ui/'] = ['src/common/', 'src/protocol/', 'src/web/traceViewer/', 'src/web/', 'src/server/trace/viewer/', 'src/server/trace/', 'src/server/trace/common/', 'src/server/snapshot/snapshotTypes.ts', 'src/protocol/channels.ts'];
 // The service is a cross-cutting feature, and so it depends on a bunch of things.
-DEPS['src/remote/'] = ['src/client/', 'src/debug/', 'src/dispatchers/', 'src/server/', 'src/server/supplements/', 'src/server/electron/', 'src/server/trace/'];
-DEPS['src/service.ts'] = ['src/remote/'];
+DEPS['src/remote/'] = ['src/client/', 'src/debug/', 'src/dispatchers/', 'src/server/', 'src/server/supplements/', 'src/server/electron/', 'src/server/trace/', 'src/utils/**'];
 
 // CLI should only use client-side features.
-DEPS['src/cli/'] = ['src/cli/**', 'src/client/**', 'src/install/**', 'src/generated/', 'src/server/injected/', 'src/debug/injected/', 'src/server/trace/**', 'src/utils/**'];
+DEPS['src/cli/'] = ['src/cli/**', 'src/client/**', 'src/generated/', 'src/server/injected/', 'src/debug/injected/', 'src/server/trace/**', 'src/utils/**', 'src/grid/**'];
 
 DEPS['src/server/supplements/recorder/recorderApp.ts'] = ['src/common/', 'src/utils/', 'src/server/', 'src/server/chromium/'];
 DEPS['src/server/supplements/recorderSupplement.ts'] = ['src/server/snapshot/', ...DEPS['src/server/']];
-DEPS['src/utils/'] = ['src/common/'];
+DEPS['src/utils/'] = ['src/common/', 'src/protocol/'];
 
 // Trace viewer
 DEPS['src/server/trace/common/'] = ['src/server/snapshot/', ...DEPS['src/server/']];
 DEPS['src/server/trace/recorder/'] = ['src/server/trace/common/', ...DEPS['src/server/trace/common/']];
-DEPS['src/server/trace/viewer/'] = ['src/server/trace/common/', ...DEPS['src/server/trace/common/']];
+DEPS['src/server/trace/viewer/'] = ['src/server/trace/common/', 'src/server/trace/recorder/', 'src/server/chromium/', ...DEPS['src/server/trace/common/']];
+
+// Playwright Test
+DEPS['src/test/'] = ['src/test/**', 'src/utils/utils.ts', 'src/utils/**', 'src/protocol/channels.ts'];
+DEPS['src/test/index.ts'] = [... DEPS['src/test/'], 'src/grid/gridClient.ts' ];
+
+// HTML report
+DEPS['src/web/htmlReport/'] = ['src/test/**', 'src/web/'];
+
+// Grid
+DEPS['src/grid/'] = ['src/utils/**', 'src/dispatchers/**', 'src/server/', 'src/client/'];
 
 checkDeps().catch(e => {
   console.error(e && e.stack ? e.stack : e);

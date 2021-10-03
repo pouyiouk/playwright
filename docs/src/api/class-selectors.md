@@ -69,11 +69,102 @@ browser.close();
 ```
 
 ```python async
-# FIXME: add snippet
+import asyncio
+from playwright.async_api import async_playwright
+
+async def run(playwright):
+    tag_selector = """
+      {
+          // Returns the first element matching given selector in the root's subtree.
+          query(root, selector) {
+              return root.querySelector(selector);
+          },
+          // Returns all elements matching given selector in the root's subtree.
+          queryAll(root, selector) {
+              return Array.from(root.querySelectorAll(selector));
+          }
+      }"""
+
+    # Register the engine. Selectors will be prefixed with "tag=".
+    await playwright.selectors.register("tag", tag_selector)
+    browser = await playwright.chromium.launch()
+    page = await browser.new_page()
+    await page.set_content('<div><button>Click me</button></div>')
+
+    # Use the selector prefixed with its name.
+    button = await page.query_selector('tag=button')
+    # Combine it with other selector engines.
+    await page.click('tag=div >> text="Click me"')
+    # Can use it in any methods supporting selectors.
+    button_count = await page.eval_on_selector_all('tag=button', 'buttons => buttons.length')
+    print(button_count)
+    await browser.close()
+
+async def main():
+    async with async_playwright() as playwright:
+        await run(playwright)
+
+asyncio.run(main())
 ```
 
 ```python sync
-# FIXME: add snippet
+from playwright.sync_api import sync_playwright
+
+def run(playwright):
+    tag_selector = """
+      {
+          // Returns the first element matching given selector in the root's subtree.
+          query(root, selector) {
+              return root.querySelector(selector);
+          },
+          // Returns all elements matching given selector in the root's subtree.
+          queryAll(root, selector) {
+              return Array.from(root.querySelectorAll(selector));
+          }
+      }"""
+
+    # Register the engine. Selectors will be prefixed with "tag=".
+    playwright.selectors.register("tag", tag_selector)
+    browser = playwright.chromium.launch()
+    page = browser.new_page()
+    page.set_content('<div><button>Click me</button></div>')
+
+    # Use the selector prefixed with its name.
+    button = page.query_selector('tag=button')
+    # Combine it with other selector engines.
+    page.click('tag=div >> text="Click me"')
+    # Can use it in any methods supporting selectors.
+    button_count = page.eval_on_selector_all('tag=button', 'buttons => buttons.length')
+    print(button_count)
+    browser.close()
+
+with sync_playwright() as playwright:
+    run(playwright)
+```
+
+```csharp
+using var playwright = await Playwright.CreateAsync();
+// Script that evaluates to a selector engine instance.
+await playwright.Selectors.RegisterAsync("tag", @"{
+// Returns the first element matching given selector in the root's subtree.
+query(root, selector) {
+    return root.querySelector(selector);
+  },
+  // Returns all elements matching given selector in the root's subtree.
+  queryAll(root, selector) {
+    return Array.from(root.querySelectorAll(selector));
+  }
+}");
+
+await using var browser = await playwright.Chromium.LaunchAsync();
+var page = await browser.NewPageAsync();
+await page.SetContentAsync("<div><button>Click me</button></div>");
+// Use the selector prefixed with its name.
+var button = await page.QuerySelectorAsync("tag=button");
+// Combine it with other selector engines.
+await page.ClickAsync("tag=div >> text=\"Click me\"");
+// Can use it in any methods supporting selectors.
+int buttonCount = await page.EvalOnSelectorAllAsync<int>("tag=button", "buttons => buttons.length");
 ```
 
 ### param: Selectors.register.name
@@ -92,8 +183,20 @@ contain `[a-zA-Z0-9_]` characters.
 Script that evaluates to a selector engine instance.
 
 ### param: Selectors.register.script
-* langs: csharp, java
+* langs: java
 - `script` <[string]|[path]>
+
+Script that evaluates to a selector engine instance.
+
+### option: Selectors.register.script
+* langs: csharp
+- `script` <[string]>
+
+Script that evaluates to a selector engine instance.
+
+### option: Selectors.register.path
+* langs: csharp
+- `path` <[path]>
 
 Script that evaluates to a selector engine instance.
 

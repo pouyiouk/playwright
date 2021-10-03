@@ -16,34 +16,49 @@
 
 import { HttpServer } from '../../utils/httpServer';
 import { BrowserContext } from '../browserContext';
-import { helper } from '../helper';
+import { eventsHelper } from '../../utils/eventsHelper';
 import { Page } from '../page';
-import { FrameSnapshot, ResourceSnapshot } from './snapshotTypes';
+import { FrameSnapshot } from './snapshotTypes';
 import { SnapshotRenderer } from './snapshotRenderer';
 import { SnapshotServer } from './snapshotServer';
 import { BaseSnapshotStorage } from './snapshotStorage';
 import { Snapshotter, SnapshotterBlob, SnapshotterDelegate } from './snapshotter';
 import { ElementHandle } from '../dom';
+import { HarTracer, HarTracerDelegate } from '../supplements/har/harTracer';
+import * as har from '../supplements/har/har';
 
-export class InMemorySnapshotter extends BaseSnapshotStorage implements SnapshotterDelegate {
+export class InMemorySnapshotter extends BaseSnapshotStorage implements SnapshotterDelegate, HarTracerDelegate {
   private _blobs = new Map<string, Buffer>();
   private _server: HttpServer;
   private _snapshotter: Snapshotter;
+  private _harTracer: HarTracer;
 
   constructor(context: BrowserContext) {
     super();
     this._server = new HttpServer();
     new SnapshotServer(this._server, this);
     this._snapshotter = new Snapshotter(context, this);
+    this._harTracer = new HarTracer(context, this, { content: 'sha1', waitForContentOnStop: false, skipScripts: true });
   }
 
   async initialize(): Promise<string> {
-    await this._snapshotter.initialize();
+    await this._snapshotter.start();
+    this._harTracer.start();
     return await this._server.start();
+  }
+
+  async reset() {
+    await this._snapshotter.reset();
+    await this._harTracer.flush();
+    this._harTracer.stop();
+    this._harTracer.start();
+    this.clear();
   }
 
   async dispose() {
     this._snapshotter.dispose();
+    await this._harTracer.flush();
+    this._harTracer.stop();
     await this._server.stop();
   }
 
@@ -51,27 +66,30 @@ export class InMemorySnapshotter extends BaseSnapshotStorage implements Snapshot
     if (this._frameSnapshots.has(snapshotName))
       throw new Error('Duplicate snapshot name: ' + snapshotName);
 
-    this._snapshotter.captureSnapshot(page, snapshotName, element);
+    this._snapshotter.captureSnapshot(page, snapshotName, element).catch(() => {});
     return new Promise<SnapshotRenderer>(fulfill => {
-      const listener = helper.addEventListener(this, 'snapshot', (renderer: SnapshotRenderer) => {
+      const listener = eventsHelper.addEventListener(this, 'snapshot', (renderer: SnapshotRenderer) => {
         if (renderer.snapshotName === snapshotName) {
-          helper.removeEventListeners([listener]);
+          eventsHelper.removeEventListeners([listener]);
           fulfill(renderer);
         }
       });
     });
   }
 
-  async setAutoSnapshotIntervalForTest(interval: number): Promise<void> {
-    await this._snapshotter.setAutoSnapshotInterval(interval);
+  onEntryStarted(entry: har.Entry) {
   }
 
-  onBlob(blob: SnapshotterBlob): void {
+  onEntryFinished(entry: har.Entry) {
+    this.addResource(entry);
+  }
+
+  onContentBlob(sha1: string, buffer: Buffer) {
+    this._blobs.set(sha1, buffer);
+  }
+
+  onSnapshotterBlob(blob: SnapshotterBlob): void {
     this._blobs.set(blob.sha1, blob.buffer);
-  }
-
-  onResourceSnapshot(resource: ResourceSnapshot): void {
-    this.addResource(resource);
   }
 
   onFrameSnapshot(snapshot: FrameSnapshot): void {

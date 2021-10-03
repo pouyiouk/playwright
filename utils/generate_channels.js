@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+// @ts-check
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -167,6 +169,9 @@ export function createScheme(tChannel: (name: string) => Validator): Scheme {
   };
 `];
 
+const tracingSnapshots = [];
+const pausesBeforeInputActions = [];
+
 const yml = fs.readFileSync(path.join(__dirname, '..', 'src', 'protocol', 'protocol.yml'), 'utf-8');
 const protocol = yaml.parse(yml);
 
@@ -185,6 +190,18 @@ for (const [name, value] of Object.entries(protocol)) {
     mixins.set(name, value);
 }
 
+const derivedClasses = new Map();
+for (const [name, item] of Object.entries(protocol)) {
+  if (item.type === 'interface' && item.extends) {
+    let items = derivedClasses.get(item.extends);
+    if (!items) {
+      items = [];
+      derivedClasses.set(item.extends, items);
+    }
+    items.push(name);
+  }
+}
+
 for (const [name, item] of Object.entries(protocol)) {
   if (item.type === 'interface') {
     const channelName = name;
@@ -196,6 +213,8 @@ for (const [name, item] of Object.entries(protocol)) {
     channels_ts.push(`export interface ${channelName}Channel extends ${(item.extends || '') + 'Channel'} {`);
     const ts_types = new Map();
 
+    /** @type{{eventName: string, eventType: string}[]} */
+    const eventTypes = [];
     for (let [eventName, event] of Object.entries(item.events || {})) {
       if (event === null)
         event = {};
@@ -203,11 +222,22 @@ for (const [name, item] of Object.entries(protocol)) {
       const paramsName = `${channelName}${titleCase(eventName)}Event`;
       ts_types.set(paramsName, parameters.ts);
       channels_ts.push(`  on(event: '${eventName}', callback: (params: ${paramsName}) => void): this;`);
+      eventTypes.push({eventName, eventType: paramsName});
     }
 
     for (let [methodName, method] of Object.entries(item.commands || {})) {
       if (method === null)
         method = {};
+      if (method.tracing && method.tracing.snapshot) {
+        tracingSnapshots.push(name + '.' + methodName);
+        for (const derived of derivedClasses.get(name) || [])
+          tracingSnapshots.push(derived + '.' + methodName);
+      }
+      if (method.tracing && method.tracing.pausesBeforeInput) {
+        pausesBeforeInputActions.push(name + '.' + methodName);
+        for (const derived of derivedClasses.get(name) || [])
+          pausesBeforeInputActions.push(derived + '.' + methodName);
+      }
       const parameters = objectType(method.parameters || {}, '');
       const paramsName = `${channelName}${titleCase(methodName)}Params`;
       const optionsName = `${channelName}${titleCase(methodName)}Options`;
@@ -230,6 +260,12 @@ for (const [name, item] of Object.entries(protocol)) {
     for (const [typeName, typeValue] of ts_types)
       channels_ts.push(`export type ${typeName} = ${typeValue};`);
     channels_ts.push(``);
+
+    channels_ts.push(`export interface ${channelName}Events {`);
+    for (const {eventName, eventType} of eventTypes)
+        channels_ts.push(`  '${eventName}': ${eventType};`);
+    channels_ts.push(`}\n`);
+
   } else if (item.type === 'object') {
     const inner = objectType(item.properties, '');
     channels_ts.push(`export type ${name} = ${inner.ts};`);
@@ -237,6 +273,14 @@ for (const [name, item] of Object.entries(protocol)) {
     addScheme(name, inner.scheme);
   }
 }
+
+channels_ts.push(`export const commandsWithTracingSnapshots = new Set([
+  '${tracingSnapshots.join(`',\n  '`)}'
+]);`);
+channels_ts.push('');
+channels_ts.push(`export const pausesBeforeInputActions = new Set([
+  '${pausesBeforeInputActions.join(`',\n  '`)}'
+]);`);
 
 validator_ts.push(`
   return scheme;

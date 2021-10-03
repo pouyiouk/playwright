@@ -16,7 +16,7 @@
 
 import fs from 'fs';
 import { PNG } from 'pngjs';
-import { test, expect } from '../config/androidTest';
+import { androidTest as test, expect } from './androidTest';
 
 test('androidDevice.shell', async function({ androidDevice }) {
   const output = await androidDevice.shell('echo 123');
@@ -28,7 +28,7 @@ test('androidDevice.open', async function({ androidDevice }) {
   await socket.write(Buffer.from('321\n'));
   const output = await new Promise(resolve => socket.on('data', resolve));
   expect(output.toString()).toBe('321\n');
-  const closedPromise = new Promise(resolve => socket.on('close', resolve));
+  const closedPromise = new Promise<void>(resolve => socket.on('close', resolve));
   await socket.close();
   await closedPromise;
 });
@@ -38,7 +38,7 @@ test('androidDevice.screenshot', async function({ androidDevice }, testInfo) {
   const result = await androidDevice.screenshot({ path });
   const buffer = fs.readFileSync(path);
   expect(result.length).toBe(buffer.length);
-  const { width, height} = PNG.sync.read(result);
+  const { width, height } = PNG.sync.read(result);
   expect(width).toBe(1080);
   expect(height).toBe(1920);
 });

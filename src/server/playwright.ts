@@ -14,20 +14,16 @@
  * limitations under the License.
  */
 
-import path from 'path';
-import { Tracer } from './trace/recorder/tracer';
 import { Android } from './android/android';
 import { AdbBackend } from './android/backendAdb';
 import { PlaywrightOptions } from './browser';
 import { Chromium } from './chromium/chromium';
 import { Electron } from './electron/electron';
 import { Firefox } from './firefox/firefox';
-import { Selectors, serverSelectors } from './selectors';
-import { HarTracer } from './supplements/har/harTracer';
-import { InspectorController } from './supplements/inspectorController';
+import { Selectors } from './selectors';
 import { WebKit } from './webkit/webkit';
-import { Registry } from '../utils/registry';
-import { InstrumentationListener, multiplexInstrumentation, SdkObject } from './instrumentation';
+import { CallMetadata, createInstrumentation, SdkObject } from './instrumentation';
+import { debugLogger } from '../utils/debugLogger';
 
 export class Playwright extends SdkObject {
   readonly selectors: Selectors;
@@ -38,28 +34,27 @@ export class Playwright extends SdkObject {
   readonly webkit: WebKit;
   readonly options: PlaywrightOptions;
 
-  constructor(isInternal: boolean) {
-    const listeners: InstrumentationListener[] = [];
-    if (!isInternal) {
-      listeners.push(new Tracer());
-      listeners.push(new HarTracer());
-      listeners.push(new InspectorController());
-    }
-    const instrumentation = multiplexInstrumentation(listeners);
-    super({ attribution: {}, instrumentation } as any);
+  constructor(sdkLanguage: string, isInternal: boolean) {
+    super({ attribution: { isInternal }, instrumentation: createInstrumentation() } as any, undefined, 'Playwright');
+    this.instrumentation.addListener({
+      onCallLog: (logName: string, message: string, sdkObject: SdkObject, metadata: CallMetadata) => {
+        debugLogger.log(logName as any, message);
+      }
+    });
     this.options = {
-      registry: new Registry(path.join(__dirname, '..', '..')),
       rootSdkObject: this,
+      selectors: new Selectors(),
+      sdkLanguage: sdkLanguage,
     };
     this.chromium = new Chromium(this.options);
     this.firefox = new Firefox(this.options);
     this.webkit = new WebKit(this.options);
     this.electron = new Electron(this.options);
     this.android = new Android(new AdbBackend(), this.options);
-    this.selectors = serverSelectors;
+    this.selectors = this.options.selectors;
   }
 }
 
-export function createPlaywright(isInternal = false) {
-  return new Playwright(isInternal);
+export function createPlaywright(sdkLanguage: string, isInternal: boolean = false) {
+  return new Playwright(sdkLanguage, isInternal);
 }

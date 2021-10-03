@@ -17,7 +17,10 @@
 import * as frames from './frames';
 import * as types from './types';
 import { assert } from '../utils/utils';
+import { ManualPromise } from '../utils/async';
 import { SdkObject } from './instrumentation';
+import { NameValue } from '../common/types';
+import { FetchRequest } from './fetch';
 
 export function filterCookies(cookies: types.NetworkCookie[], urls: string[]): types.NetworkCookie[] {
   const parsedURLs = urls.map(s => new URL(s));
@@ -50,8 +53,8 @@ export function rewriteCookies(cookies: types.SetNetworkCookieParam[]): types.Se
     assert(c.value, 'Cookie should have a value');
     assert(c.url || (c.domain && c.path), 'Cookie should have a url or a domain/path pair');
     assert(!(c.url && c.domain), 'Cookie should have either url or domain');
-    assert(!(c.url && c.path), 'Cookie should have either url or domain');
-    const copy = {...c};
+    assert(!(c.url && c.path), 'Cookie should have either url or path');
+    const copy = { ...c };
     if (copy.url) {
       assert(copy.url !== 'about:blank', `Blank page can not have cookie "${c.name}"`);
       assert(!copy.url.startsWith('data:'), `Data URL page can not have cookie "${c.name}"`);
@@ -78,11 +81,16 @@ export function stripFragmentFromUrl(url: string): string {
   return url.substring(0, url.indexOf('#'));
 }
 
+type ResponseSize = {
+  encodedBodySize: number;
+  transferSize: number;
+  responseHeadersSize: number;
+};
+
 export class Request extends SdkObject {
-  readonly _routeDelegate: RouteDelegate | null;
   private _response: Response | null = null;
   private _redirectedFrom: Request | null;
-  private _redirectedTo: Request | null = null;
+  _redirectedTo: Request | null = null;
   readonly _documentId?: string;
   readonly _isFavicon: boolean;
   _failureText: string | null = null;
@@ -90,19 +98,17 @@ export class Request extends SdkObject {
   private _resourceType: string;
   private _method: string;
   private _postData: Buffer | null;
-  private _headers: types.HeadersArray;
+  readonly _headers: types.HeadersArray;
   private _headersMap = new Map<string, string>();
   private _frame: frames.Frame;
-  private _waitForResponsePromise: Promise<Response | null>;
-  private _waitForResponsePromiseCallback: (value: Response | null) => void = () => {};
+  private _waitForResponsePromise = new ManualPromise<Response | null>();
   _responseEndTiming = -1;
+  readonly responseSize: ResponseSize = { encodedBodySize: 0, transferSize: 0, responseHeadersSize: 0 };
 
-  constructor(routeDelegate: RouteDelegate | null, frame: frames.Frame, redirectedFrom: Request | null, documentId: string | undefined,
+  constructor(frame: frames.Frame, redirectedFrom: Request | null, documentId: string | undefined,
     url: string, resourceType: string, method: string, postData: Buffer | null, headers: types.HeadersArray) {
-    super(frame);
+    super(frame, 'request');
     assert(!url.startsWith('data:'), 'Data urls should not fire requests');
-    assert(!(routeDelegate && redirectedFrom), 'Should not be able to intercept redirects');
-    this._routeDelegate = routeDelegate;
     this._frame = frame;
     this._redirectedFrom = redirectedFrom;
     if (redirectedFrom)
@@ -115,13 +121,12 @@ export class Request extends SdkObject {
     this._headers = headers;
     for (const { name, value } of this._headers)
       this._headersMap.set(name.toLowerCase(), value);
-    this._waitForResponsePromise = new Promise(f => this._waitForResponsePromiseCallback = f);
-    this._isFavicon = url.endsWith('/favicon.ico');
+    this._isFavicon = url.endsWith('/favicon.ico') || !!redirectedFrom?._isFavicon;
   }
 
   _setFailureText(failureText: string) {
     this._failureText = failureText;
-    this._waitForResponsePromiseCallback(null);
+    this._waitForResponsePromise.resolve(null);
   }
 
   url(): string {
@@ -148,7 +153,11 @@ export class Request extends SdkObject {
     return this._headersMap.get(name);
   }
 
-  response(): Promise<Response | null> {
+  async rawHeaders(): Promise<NameValue[]> {
+    return this._headers;
+  }
+
+  response(): PromiseLike<Response | null> {
     return this._waitForResponsePromise;
   }
 
@@ -158,7 +167,7 @@ export class Request extends SdkObject {
 
   _setResponse(response: Response) {
     this._response = response;
-    this._waitForResponsePromiseCallback(response);
+    this._waitForResponsePromise.resolve(response);
   }
 
   _finalRequest(): Request {
@@ -185,22 +194,8 @@ export class Request extends SdkObject {
     };
   }
 
-  _route(): Route | null {
-    if (!this._routeDelegate)
-      return null;
-    return new Route(this, this._routeDelegate);
-  }
-
-  updateWithRawHeaders(headers: types.HeadersArray) {
-    this._headers = headers;
-    this._headersMap.clear();
-    for (const { name, value } of this._headers)
-      this._headersMap.set(name.toLowerCase(), value);
-    if (!this._headersMap.has('host')) {
-      const host = new URL(this._url).host;
-      this._headers.push({ name: 'host', value: host });
-      this._headersMap.set('host', host);
-    }
+  bodySize(): number {
+    return this.postDataBuffer()?.length || 0;
   }
 }
 
@@ -208,9 +203,10 @@ export class Route extends SdkObject {
   private readonly _request: Request;
   private readonly _delegate: RouteDelegate;
   private _handled = false;
+  private _response: InterceptedResponse | null = null;
 
   constructor(request: Request, delegate: RouteDelegate) {
-    super(request.frame());
+    super(request.frame(), 'route');
     this._request = request;
     this._delegate = delegate;
   }
@@ -225,26 +221,50 @@ export class Route extends SdkObject {
     await this._delegate.abort(errorCode);
   }
 
-  async fulfill(response: { status?: number, headers?: types.HeadersArray, body?: string, isBase64?: boolean }) {
+  async fulfill(overrides: { status?: number, headers?: types.HeadersArray, body?: string, isBase64?: boolean, useInterceptedResponseBody?: boolean, fetchResponseUid?: string }) {
     assert(!this._handled, 'Route is already handled!');
     this._handled = true;
+    let body = overrides.body;
+    let isBase64 = overrides.isBase64 || false;
+    if (body === undefined) {
+      if (overrides.fetchResponseUid) {
+        const context = this._request.frame()._page._browserContext;
+        const buffer = context.fetchRequest.fetchResponses.get(overrides.fetchResponseUid) || FetchRequest.findResponseBody(overrides.fetchResponseUid);
+        assert(buffer, 'Fetch response has been disposed');
+        body = buffer.toString('base64');
+        isBase64 = true;
+      } else if (this._response && overrides.useInterceptedResponseBody) {
+        body = (await this._delegate.responseBody()).toString('base64');
+        isBase64 = true;
+      } else {
+        body = '';
+        isBase64 = false;
+      }
+    }
     await this._delegate.fulfill({
-      status: response.status === undefined ? 200 : response.status,
-      headers: response.headers || [],
-      body: response.body || '',
-      isBase64: response.isBase64 || false,
+      status: overrides.status || 200,
+      headers: overrides.headers || [],
+      body,
+      isBase64,
     });
   }
 
-  async continue(overrides: types.NormalizedContinueOverrides = {}) {
+  async continue(overrides: types.NormalizedContinueOverrides = {}): Promise<InterceptedResponse|null> {
     assert(!this._handled, 'Route is already handled!');
+    assert(!this._response, 'Cannot call continue after response interception!');
     if (overrides.url) {
       const newUrl = new URL(overrides.url);
       const oldUrl = new URL(this._request.url());
       if (oldUrl.protocol !== newUrl.protocol)
         throw new Error('New URL must have same protocol as overridden URL');
     }
-    await this._delegate.continue(overrides);
+    this._response = await this._delegate.continue(this._request, overrides);
+    return this._response;
+  }
+
+  async responseBody(): Promise<Buffer> {
+    assert(!this._handled, 'Route is already handled!');
+    return this._delegate.responseBody();
   }
 }
 
@@ -263,11 +283,30 @@ export type ResourceTiming = {
   responseStart: number;
 };
 
+export type ResourceSizes = {
+  requestBodySize: number,
+  requestHeadersSize: number,
+  responseBodySize: number,
+  responseHeadersSize: number,
+};
+
+export type RemoteAddr = {
+  ipAddress: string;
+  port: number;
+};
+
+export type SecurityDetails = {
+    protocol?: string;
+    subjectName?: string;
+    issuer?: string;
+    validFrom?: number;
+    validTo?: number;
+};
+
 export class Response extends SdkObject {
   private _request: Request;
   private _contentPromise: Promise<Buffer> | null = null;
-  _finishedPromise: Promise<{ error?: string }>;
-  private _finishedPromiseCallback: (arg: { error?: string }) => void = () => {};
+  _finishedPromise = new ManualPromise<void>();
   private _status: number;
   private _statusText: string;
   private _url: string;
@@ -275,9 +314,14 @@ export class Response extends SdkObject {
   private _headersMap = new Map<string, string>();
   private _getResponseBodyCallback: GetResponseBodyCallback;
   private _timing: ResourceTiming;
+  private _serverAddrPromise = new ManualPromise<RemoteAddr | undefined>();
+  private _securityDetailsPromise = new ManualPromise<SecurityDetails | undefined>();
+  private _rawRequestHeadersPromise: ManualPromise<types.HeadersArray> | undefined;
+  private _rawResponseHeadersPromise: ManualPromise<types.HeadersArray> | undefined;
+  private _httpVersion: string | undefined;
 
-  constructor(request: Request, status: number, statusText: string, headers: types.HeadersArray, timing: ResourceTiming, getResponseBodyCallback: GetResponseBodyCallback) {
-    super(request.frame());
+  constructor(request: Request, status: number, statusText: string, headers: types.HeadersArray, timing: ResourceTiming, getResponseBodyCallback: GetResponseBodyCallback, httpVersion?: string) {
+    super(request.frame(), 'response');
     this._request = request;
     this._timing = timing;
     this._status = status;
@@ -287,15 +331,25 @@ export class Response extends SdkObject {
     for (const { name, value } of this._headers)
       this._headersMap.set(name.toLowerCase(), value);
     this._getResponseBodyCallback = getResponseBodyCallback;
-    this._finishedPromise = new Promise(f => {
-      this._finishedPromiseCallback = f;
-    });
     this._request._setResponse(this);
+    this._httpVersion = httpVersion;
   }
 
-  _requestFinished(responseEndTiming: number, error?: string) {
+  _serverAddrFinished(addr?: RemoteAddr) {
+    this._serverAddrPromise.resolve(addr);
+  }
+
+  _securityDetailsFinished(securityDetails?: SecurityDetails) {
+    this._securityDetailsPromise.resolve(securityDetails);
+  }
+
+  _requestFinished(responseEndTiming: number) {
     this._request._responseEndTiming = Math.max(responseEndTiming, this._timing.responseStart);
-    this._finishedPromiseCallback({ error });
+    this._finishedPromise.resolve();
+  }
+
+  _setHttpVersion(httpVersion: string) {
+    this._httpVersion = httpVersion;
   }
 
   url(): string {
@@ -318,19 +372,48 @@ export class Response extends SdkObject {
     return this._headersMap.get(name);
   }
 
-  finished(): Promise<Error | null> {
-    return this._finishedPromise.then(({ error }) => error ? new Error(error) : null);
+  async rawRequestHeaders(): Promise<NameValue[]> {
+    return this._rawRequestHeadersPromise || Promise.resolve(this._request._headers);
+  }
+
+  async rawResponseHeaders(): Promise<NameValue[]> {
+    return this._rawResponseHeadersPromise || Promise.resolve(this._headers);
+  }
+
+  setWillReceiveExtraHeaders() {
+    this._rawRequestHeadersPromise = new ManualPromise();
+    this._rawResponseHeadersPromise = new ManualPromise();
+  }
+
+  setRawRequestHeaders(headers: types.HeadersArray) {
+    if (!this._rawRequestHeadersPromise)
+      this._rawRequestHeadersPromise = new ManualPromise();
+    this._rawRequestHeadersPromise!.resolve(headers);
+  }
+
+  setRawResponseHeaders(headers: types.HeadersArray) {
+    if (!this._rawResponseHeadersPromise)
+      this._rawResponseHeadersPromise = new ManualPromise();
+    this._rawResponseHeadersPromise!.resolve(headers);
   }
 
   timing(): ResourceTiming {
     return this._timing;
   }
 
+  async serverAddr(): Promise<RemoteAddr|null> {
+    return await this._serverAddrPromise || null;
+  }
+
+  async securityDetails(): Promise<SecurityDetails|null> {
+    return await this._securityDetailsPromise || null;
+  }
+
   body(): Promise<Buffer> {
     if (!this._contentPromise) {
-      this._contentPromise = this._finishedPromise.then(async ({ error }) => {
-        if (error)
-          throw new Error(error);
+      this._contentPromise = this._finishedPromise.then(async () => {
+        if (this._status >= 300 && this._status <= 399)
+          throw new Error('Response body is unavailable for redirect responses');
         return this._getResponseBodyCallback();
       });
     }
@@ -343,6 +426,92 @@ export class Response extends SdkObject {
 
   frame(): frames.Frame {
     return this._request.frame();
+  }
+
+  httpVersion(): string {
+    if (!this._httpVersion)
+      return 'HTTP/1.1';
+    if (this._httpVersion === 'http/1.1')
+      return 'HTTP/1.1';
+    return this._httpVersion;
+  }
+
+  private async _requestHeadersSize(): Promise<number> {
+    let headersSize = 4; // 4 = 2 spaces + 2 line breaks (GET /path \r\n)
+    headersSize += this._request.method().length;
+    headersSize += (new URL(this.url())).pathname.length;
+    headersSize += 8; // httpVersion
+    const headers = this._rawRequestHeadersPromise ? await this._rawRequestHeadersPromise : this._request._headers;
+    for (const header of headers)
+      headersSize += header.name.length + header.value.length + 4; // 4 = ': ' + '\r\n'
+    return headersSize;
+  }
+
+  private async _responseHeadersSize(): Promise<number> {
+    if (this._request.responseSize.responseHeadersSize)
+      return this._request.responseSize.responseHeadersSize;
+    let headersSize = 4; // 4 = 2 spaces + 2 line breaks (HTTP/1.1 200 Ok\r\n)
+    headersSize += 8; // httpVersion;
+    headersSize += 3; // statusCode;
+    headersSize += this.statusText().length;
+    const headers = await this._bestEffortResponseHeaders();
+    for (const header of headers)
+      headersSize += header.name.length + header.value.length + 4; // 4 = ': ' + '\r\n'
+    headersSize += 2; // '\r\n'
+    return headersSize;
+  }
+
+  private async _bestEffortResponseHeaders(): Promise<types.HeadersArray> {
+    return this._rawResponseHeadersPromise ? await this._rawResponseHeadersPromise : this._headers;
+  }
+
+  async sizes(): Promise<ResourceSizes> {
+    await this._finishedPromise;
+    const requestHeadersSize = await this._requestHeadersSize();
+    const responseHeadersSize = await this._responseHeadersSize();
+    let { encodedBodySize } = this._request.responseSize;
+    if (!encodedBodySize) {
+      const headers = await this._bestEffortResponseHeaders();
+      const contentLength = headers.find(h => h.name.toLowerCase() === 'content-length')?.value;
+      encodedBodySize = contentLength ? +contentLength : 0;
+    }
+    return {
+      requestBodySize: this._request.bodySize(),
+      requestHeadersSize,
+      responseBodySize: encodedBodySize,
+      responseHeadersSize,
+    };
+  }
+}
+
+export class InterceptedResponse extends SdkObject {
+  private readonly _request: Request;
+  private readonly _status: number;
+  private readonly _statusText: string;
+  private readonly _headers: types.HeadersArray;
+
+  constructor(request: Request, status: number, statusText: string, headers: types.HeadersArray) {
+    super(request.frame(), 'interceptedResponse');
+    this._request = request._finalRequest();
+    this._status = status;
+    this._statusText = statusText;
+    this._headers = headers;
+  }
+
+  status(): number {
+    return this._status;
+  }
+
+  statusText(): string {
+    return this._statusText;
+  }
+
+  headers(): types.HeadersArray {
+    return this._headers;
+  }
+
+  request(): Request {
+    return this._request;
   }
 }
 
@@ -357,7 +526,7 @@ export class WebSocket extends SdkObject {
   };
 
   constructor(parent: SdkObject, url: string) {
-    super(parent);
+    super(parent, 'ws');
     this._url = url;
   }
 
@@ -385,7 +554,8 @@ export class WebSocket extends SdkObject {
 export interface RouteDelegate {
   abort(errorCode: string): Promise<void>;
   fulfill(response: types.NormalizedFulfillResponse): Promise<void>;
-  continue(overrides: types.NormalizedContinueOverrides): Promise<void>;
+  continue(request: Request, overrides: types.NormalizedContinueOverrides): Promise<InterceptedResponse|null>;
+  responseBody(): Promise<Buffer>;
 }
 
 // List taken from https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml with extra 306 and 418 codes.

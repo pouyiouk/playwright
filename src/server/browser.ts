@@ -21,10 +21,9 @@ import { Download } from './download';
 import { ProxySettings } from './types';
 import { ChildProcess } from 'child_process';
 import { RecentLogsCollector } from '../utils/debugLogger';
-import * as registry from '../utils/registry';
 import { SdkObject } from './instrumentation';
 import { Artifact } from './artifact';
-import { kBrowserClosedError } from '../utils/errors';
+import { Selectors } from './selectors';
 
 export interface BrowserProcess {
   onclose?: ((exitCode: number | null, signal: string | null) => void);
@@ -34,18 +33,23 @@ export interface BrowserProcess {
 }
 
 export type PlaywrightOptions = {
-  registry: registry.Registry,
-  rootSdkObject: SdkObject,
+  rootSdkObject: SdkObject;
+  selectors: Selectors;
+  socksProxyPort?: number;
+  sdkLanguage: string,
 };
 
 export type BrowserOptions = PlaywrightOptions & {
   name: string,
   isChromium: boolean,
-  channel?: types.BrowserChannel,
-  downloadsPath?: string,
+  channel?: string,
+  artifactsDir: string;
+  downloadsPath: string,
+  tracesDir: string,
   headful?: boolean,
   persistent?: types.BrowserContextOptions,  // Undefined means no persistent context.
   browserProcess: BrowserProcess,
+  customExecutablePath?: string;
   proxy?: ProxySettings,
   protocolLogger: types.ProtocolLogger,
   browserLogsCollector: RecentLogsCollector,
@@ -65,7 +69,7 @@ export abstract class Browser extends SdkObject {
   readonly _idToVideo = new Map<string, { context: BrowserContext, artifact: Artifact }>();
 
   constructor(options: BrowserOptions) {
-    super(options.rootSdkObject);
+    super(options.rootSdkObject, 'browser');
     this.attribution.browser = this;
     this.options = options;
   }
@@ -74,6 +78,7 @@ export abstract class Browser extends SdkObject {
   abstract contexts(): BrowserContext[];
   abstract isConnected(): boolean;
   abstract version(): string;
+  abstract userAgent(): string;
 
   _downloadCreated(page: Page, uuid: string, url: string, suggestedFilename?: string) {
     const download = new Download(page, this.options.downloadsPath || '', uuid, url, suggestedFilename);
@@ -96,7 +101,7 @@ export abstract class Browser extends SdkObject {
   }
 
   _videoStarted(context: BrowserContext, videoId: string, path: string, pageOrError: Promise<Page | Error>) {
-    const artifact = new Artifact(path);
+    const artifact = new Artifact(context, path);
     this._idToVideo.set(videoId, { context, artifact });
     context.emit(BrowserContext.Events.VideoStarted, artifact);
     pageOrError.then(page => {
@@ -118,9 +123,6 @@ export abstract class Browser extends SdkObject {
       context._browserClosed();
     if (this._defaultContext)
       this._defaultContext._browserClosed();
-    for (const video of this._idToVideo.values())
-      video.artifact.reportFinished(kBrowserClosedError);
-    this._idToVideo.clear();
     this.emit(Browser.Events.Disconnected);
   }
 

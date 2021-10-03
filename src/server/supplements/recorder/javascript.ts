@@ -18,13 +18,20 @@ import type { BrowserContextOptions } from '../../../..';
 import { LanguageGenerator, LanguageGeneratorOptions, sanitizeDeviceOptions, toSignalMap } from './language';
 import { ActionInContext } from './codeGenerator';
 import { Action, actionTitle } from './recorderActions';
-import { MouseClickOptions, toModifiers } from './utils';
-import deviceDescriptors = require('../../deviceDescriptors');
+import { escapeWithQuotes, MouseClickOptions, toModifiers } from './utils';
+import deviceDescriptors from '../../deviceDescriptors';
 
 export class JavaScriptLanguageGenerator implements LanguageGenerator {
-  id = 'javascript';
-  fileName = '<javascript>';
+  id: string;
+  fileName: string;
   highlighter = 'javascript';
+  private _isTest: boolean;
+
+  constructor(isTest: boolean) {
+    this.id = isTest ? 'test' : 'javascript';
+    this.fileName = isTest ? 'Playwright Test' : 'JavaScript';
+    this._isTest = isTest;
+  }
 
   generateAction(actionInContext: ActionInContext): string {
     const { action, pageAlias } = actionInContext;
@@ -33,9 +40,11 @@ export class JavaScriptLanguageGenerator implements LanguageGenerator {
     formatter.add('// ' + actionTitle(action));
 
     if (action.name === 'openPage') {
+      if (this._isTest)
+        return '';
       formatter.add(`const ${pageAlias} = await context.newPage();`);
       if (action.url && action.url !== 'about:blank' && action.url !== 'chrome://newtab/')
-        formatter.add(`${pageAlias}.goto('${action.url}');`);
+        formatter.add(`await ${pageAlias}.goto(${quote(action.url)});`);
       return formatter.format();
     }
 
@@ -82,10 +91,14 @@ export class JavaScriptLanguageGenerator implements LanguageGenerator {
     const suffix = (signals.waitForNavigation || emitPromiseAll) ? '' : ';';
     formatter.add(`${prefix}${subject}.${actionCall}${suffix}`);
 
-    if (emitPromiseAll)
+    if (emitPromiseAll) {
       formatter.add(`]);`);
-    else if (signals.assertNavigation)
-      formatter.add(`  // assert.equal(${pageAlias}.url(), ${quote(signals.assertNavigation.url)});`);
+    } else if (signals.assertNavigation) {
+      if (this._isTest)
+        formatter.add(`  await expect(${pageAlias}).toHaveURL(${quote(signals.assertNavigation.url)});`);
+      else
+        formatter.add(`  // assert.equal(${pageAlias}.url(), ${quote(signals.assertNavigation.url)});`);
+    }
     return formatter.format();
   }
 
@@ -131,6 +144,32 @@ export class JavaScriptLanguageGenerator implements LanguageGenerator {
   }
 
   generateHeader(options: LanguageGeneratorOptions): string {
+    if (this._isTest)
+      return this.generateTestHeader(options);
+    return this.generateStandaloneHeader(options);
+  }
+
+  generateFooter(saveStorage: string | undefined): string {
+    if (this._isTest)
+      return this.generateTestFooter(saveStorage);
+    return this.generateStandaloneFooter(saveStorage);
+  }
+
+  generateTestHeader(options: LanguageGeneratorOptions): string {
+    const formatter = new JavaScriptFormatter();
+    const useText = formatContextOptions(options.contextOptions, options.deviceName);
+    formatter.add(`
+      const { test, expect${options.deviceName ? ', devices' : ''} } = require('@playwright/test');
+${useText ? '\ntest.use(' + useText + ');\n' : ''}
+      test('test', async ({ page }) => {`);
+    return formatter.format();
+  }
+
+  generateTestFooter(saveStorage: string | undefined): string {
+    return `\n});`;
+  }
+
+  generateStandaloneHeader(options: LanguageGeneratorOptions): string {
     const formatter = new JavaScriptFormatter();
     formatter.add(`
       const { ${options.browserName}${options.deviceName ? ', devices' : ''} } = require('playwright');
@@ -141,8 +180,8 @@ export class JavaScriptLanguageGenerator implements LanguageGenerator {
     return formatter.format();
   }
 
-  generateFooter(saveStorage: string | undefined): string {
-    const storageStateLine = saveStorage ? `\n  await context.storageState({ path: '${saveStorage}' });` : '';
+  generateStandaloneFooter(saveStorage: string | undefined): string {
+    const storageStateLine = saveStorage ? `\n  await context.storageState({ path: ${quote(saveStorage)} });` : '';
     return `\n  // ---------------------${storageStateLine}
   await context.close();
   await browser.close();
@@ -189,7 +228,7 @@ function formatContextOptions(options: BrowserContextOptions, deviceName: string
   if (!serializedObject)
     serializedObject = '{\n}';
   const lines = serializedObject.split('\n');
-  lines.splice(1, 0, `...devices['${deviceName}'],`);
+  lines.splice(1, 0, `...devices[${quote(deviceName!)}],`);
   return lines.join('\n');
 }
 
@@ -236,12 +275,6 @@ export class JavaScriptFormatter {
   }
 }
 
-function quote(text: string, char: string = '\'') {
-  if (char === '\'')
-    return char + text.replace(/[']/g, '\\\'') + char;
-  if (char === '"')
-    return char + text.replace(/["]/g, '\\"') + char;
-  if (char === '`')
-    return char + text.replace(/[`]/g, '\\`') + char;
-  throw new Error('Invalid escape char');
+function quote(text: string) {
+  return escapeWithQuotes(text, '\'');
 }

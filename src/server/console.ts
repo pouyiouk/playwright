@@ -14,16 +14,18 @@
  * limitations under the License.
  */
 
+import { SdkObject } from './instrumentation';
 import * as js from './javascript';
 import { ConsoleMessageLocation } from './types';
 
-export class ConsoleMessage {
+export class ConsoleMessage extends SdkObject {
   private _type: string;
   private _text?: string;
   private _args: js.JSHandle[];
   private _location: ConsoleMessageLocation;
 
-  constructor(type: string, text: string | undefined, args: js.JSHandle[], location?: ConsoleMessageLocation) {
+  constructor(parent: SdkObject, type: string, text: string | undefined, args: js.JSHandle[], location?: ConsoleMessageLocation) {
+    super(parent, 'console-message');
     this._type = type;
     this._text = text;
     this._args = args;
@@ -36,7 +38,7 @@ export class ConsoleMessage {
 
   text(): string {
     if (this._text === undefined)
-      this._text = this._args.map(arg => arg._value).join(' ');
+      this._text = this._args.map(arg => arg.preview()).join(' ');
     return this._text;
   }
 

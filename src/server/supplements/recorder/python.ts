@@ -18,12 +18,12 @@ import type { BrowserContextOptions } from '../../../..';
 import { LanguageGenerator, LanguageGeneratorOptions, sanitizeDeviceOptions, toSignalMap } from './language';
 import { ActionInContext } from './codeGenerator';
 import { actionTitle, Action } from './recorderActions';
-import { MouseClickOptions, toModifiers } from './utils';
-import deviceDescriptors = require('../../deviceDescriptors');
+import { escapeWithQuotes, MouseClickOptions, toModifiers } from './utils';
+import deviceDescriptors from '../../deviceDescriptors';
 
 export class PythonLanguageGenerator implements LanguageGenerator {
   id = 'python';
-  fileName = '<python>';
+  fileName = 'Python';
   highlighter = 'python';
 
   private _awaitPrefix: '' | 'await ';
@@ -32,7 +32,7 @@ export class PythonLanguageGenerator implements LanguageGenerator {
 
   constructor(isAsync: boolean) {
     this.id = isAsync ? 'python-async' : 'python';
-    this.fileName = isAsync ? '<async python>' : '<python>';
+    this.fileName = isAsync ? 'Python Async' : 'Python';
     this._isAsync = isAsync;
     this._awaitPrefix = isAsync ? 'await ' : '';
     this._asyncPrefix = isAsync ? 'async ' : '';
@@ -47,7 +47,7 @@ export class PythonLanguageGenerator implements LanguageGenerator {
     if (action.name === 'openPage') {
       formatter.add(`${pageAlias} = ${this._awaitPrefix}context.new_page()`);
       if (action.url && action.url !== 'about:blank' && action.url !== 'chrome://newtab/')
-        formatter.add(`${pageAlias}.goto('${action.url}')`);
+        formatter.add(`${this._awaitPrefix}${pageAlias}.goto(${quote(action.url)})`);
       return formatter.format();
     }
 
@@ -139,16 +139,19 @@ export class PythonLanguageGenerator implements LanguageGenerator {
     if (this._isAsync) {
       formatter.add(`
 import asyncio
-from playwright.async_api import async_playwright
 
-async def run(playwright) {
+from playwright.async_api import Playwright, async_playwright
+
+
+async def run(playwright: Playwright) -> None {
     browser = await playwright.${options.browserName}.launch(${formatOptions(options.launchOptions, false)})
     context = await browser.new_context(${formatContextOptions(options.contextOptions, options.deviceName)})`);
     } else {
       formatter.add(`
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Playwright, sync_playwright
 
-def run(playwright) {
+
+def run(playwright: Playwright) -> None {
     browser = playwright.${options.browserName}.launch(${formatOptions(options.launchOptions, false)})
     context = browser.new_context(${formatContextOptions(options.contextOptions, options.deviceName)})`);
     }
@@ -157,23 +160,29 @@ def run(playwright) {
 
   generateFooter(saveStorage: string | undefined): string {
     if (this._isAsync) {
-      const storageStateLine = saveStorage ? `\n    await context.storage_state(path="${saveStorage}")` : '';
+      const storageStateLine = saveStorage ? `\n    await context.storage_state(path=${quote(saveStorage)})` : '';
       return `\n    # ---------------------${storageStateLine}
     await context.close()
     await browser.close()
 
-async def main():
+
+async def main() -> None:
     async with async_playwright() as playwright:
         await run(playwright)
-asyncio.run(main())`;
+
+
+asyncio.run(main())
+`;
     } else {
-      const storageStateLine = saveStorage ? `\n    context.storage_state(path="${saveStorage}")` : '';
+      const storageStateLine = saveStorage ? `\n    context.storage_state(path=${quote(saveStorage)})` : '';
       return `\n    # ---------------------${storageStateLine}
     context.close()
     browser.close()
 
+
 with sync_playwright() as playwright:
-    run(playwright)`;
+    run(playwright)
+`;
     }
   }
 }
@@ -208,7 +217,7 @@ function formatContextOptions(options: BrowserContextOptions, deviceName: string
   const device = deviceName && deviceDescriptors[deviceName];
   if (!device)
     return formatOptions(options, false);
-  return `**playwright.devices["${deviceName}"]` + formatOptions(sanitizeDeviceOptions(device, options), true);
+  return `**playwright.devices[${quote(deviceName!)}]` + formatOptions(sanitizeDeviceOptions(device, options), true);
 }
 
 class PythonFormatter {
@@ -255,12 +264,6 @@ class PythonFormatter {
   }
 }
 
-function quote(text: string, char: string = '\"') {
-  if (char === '\'')
-    return char + text.replace(/[']/g, '\\\'') + char;
-  if (char === '"')
-    return char + text.replace(/["]/g, '\\"') + char;
-  if (char === '`')
-    return char + text.replace(/[`]/g, '\\`') + char;
-  throw new Error('Invalid escape char');
+function quote(text: string) {
+  return escapeWithQuotes(text, '\"');
 }

@@ -20,6 +20,7 @@ import { FFSession } from './ffConnection';
 import { Protocol } from './protocol';
 import { rewriteErrorMessage } from '../../utils/stackTrace';
 import { parseEvaluationResultValue } from '../common/utilityScriptSerializers';
+import { isSessionClosedError } from '../common/protocolError';
 
 export class FFExecutionContext implements js.ExecutionContextDelegate {
   _session: FFSession;
@@ -30,7 +31,17 @@ export class FFExecutionContext implements js.ExecutionContextDelegate {
     this._executionContextId = executionContextId;
   }
 
-  async rawEvaluate(expression: string): Promise<string> {
+  async rawEvaluateJSON(expression: string): Promise<any> {
+    const payload = await this._session.send('Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+      executionContextId: this._executionContextId,
+    }).catch(rewriteError);
+    checkException(payload.exceptionDetails);
+    return payload.result!.value;
+  }
+
+  async rawEvaluateHandle(expression: string): Promise<js.ObjectId> {
     const payload = await this._session.send('Runtime.evaluate', {
       expression,
       returnByValue: false,
@@ -78,7 +89,7 @@ export class FFExecutionContext implements js.ExecutionContextDelegate {
   }
 
   createHandle(context: js.ExecutionContext, remoteObject: Protocol.Runtime.RemoteObject): js.JSHandle {
-    return new js.JSHandle(context, remoteObject.subtype || remoteObject.type || '', remoteObject.objectId, potentiallyUnserializableValue(remoteObject));
+    return new js.JSHandle(context, remoteObject.subtype || remoteObject.type || '', renderPreview(remoteObject), remoteObject.objectId, potentiallyUnserializableValue(remoteObject));
   }
 
   async releaseHandle(objectId: js.ObjectId): Promise<void> {
@@ -93,18 +104,18 @@ function checkException(exceptionDetails?: Protocol.Runtime.ExceptionDetails) {
   if (!exceptionDetails)
     return;
   if (exceptionDetails.value)
-    throw new Error('Evaluation failed: ' + JSON.stringify(exceptionDetails.value));
+    throw new js.JavaScriptErrorInEvaluate(JSON.stringify(exceptionDetails.value));
   else
-    throw new Error('Evaluation failed: ' + exceptionDetails.text + '\n' + exceptionDetails.stack);
+    throw new js.JavaScriptErrorInEvaluate(exceptionDetails.text + (exceptionDetails.stack ? '\n' + exceptionDetails.stack : ''));
 }
 
 function rewriteError(error: Error): (Protocol.Runtime.evaluateReturnValue | Protocol.Runtime.callFunctionReturnValue) {
   if (error.message.includes('cyclic object value') || error.message.includes('Object is not serializable'))
-    return {result: {type: 'undefined', value: undefined}};
-  if (error.message.includes('Failed to find execution context with id') || error.message.includes('Execution context was destroyed!'))
-    throw new Error('Execution context was destroyed, most likely because of a navigation.');
+    return { result: { type: 'undefined', value: undefined } };
   if (error instanceof TypeError && error.message.startsWith('Converting circular structure to JSON'))
     rewriteErrorMessage(error, error.message + ' Are you passing a nested JSHandle?');
+  if (!js.isJavaScriptErrorInEvaluate(error) && !isSessionClosedError(error))
+    throw new Error('Execution context was destroyed, most likely because of a navigation.');
   throw error;
 }
 
@@ -112,4 +123,23 @@ function potentiallyUnserializableValue(remoteObject: Protocol.Runtime.RemoteObj
   const value = remoteObject.value;
   const unserializableValue = remoteObject.unserializableValue;
   return unserializableValue ? js.parseUnserializableValue(unserializableValue) : value;
+}
+
+function renderPreview(object: Protocol.Runtime.RemoteObject): string | undefined {
+  if (object.type === 'undefined')
+    return 'undefined';
+  if (object.unserializableValue)
+    return String(object.unserializableValue);
+  if (object.type === 'symbol')
+    return 'Symbol()';
+  if (object.subtype === 'regexp')
+    return 'RegExp';
+  if (object.subtype === 'weakmap')
+    return 'WeakMap';
+  if (object.subtype === 'weakset')
+    return 'WeakSet';
+  if (object.subtype)
+    return object.subtype[0].toUpperCase() + object.subtype.slice(1);
+  if ('value' in object)
+    return String(object.value);
 }

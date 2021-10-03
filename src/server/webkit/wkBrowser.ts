@@ -17,7 +17,7 @@
 
 import { Browser, BrowserOptions } from '../browser';
 import { assertBrowserContextIsNotOwned, BrowserContext, validateBrowserContextOptions, verifyGeolocation } from '../browserContext';
-import { helper, RegisteredListener } from '../helper';
+import { eventsHelper, RegisteredListener } from '../../utils/eventsHelper';
 import { assert } from '../../utils/utils';
 import * as network from '../network';
 import { Page, PageBinding, PageDelegate } from '../page';
@@ -26,9 +26,10 @@ import * as types from '../types';
 import { Protocol } from './protocol';
 import { kPageProxyMessageReceived, PageProxyMessageReceivedPayload, WKConnection, WKSession } from './wkConnection';
 import { WKPage } from './wkPage';
+import { kBrowserClosedError } from '../../utils/errors';
 
-const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.2 Safari/605.1.15';
-const BROWSER_VERSION = '14.2';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15';
+const BROWSER_VERSION = '15.0';
 
 export class WKBrowser extends Browser {
   private readonly _connection: WKConnection;
@@ -57,21 +58,24 @@ export class WKBrowser extends Browser {
     this._connection = new WKConnection(transport, this._onDisconnect.bind(this), options.protocolLogger, options.browserLogsCollector);
     this._browserSession = this._connection.browserSession;
     this._eventListeners = [
-      helper.addEventListener(this._browserSession, 'Playwright.pageProxyCreated', this._onPageProxyCreated.bind(this)),
-      helper.addEventListener(this._browserSession, 'Playwright.pageProxyDestroyed', this._onPageProxyDestroyed.bind(this)),
-      helper.addEventListener(this._browserSession, 'Playwright.provisionalLoadFailed', event => this._onProvisionalLoadFailed(event)),
-      helper.addEventListener(this._browserSession, 'Playwright.windowOpen', event => this._onWindowOpen(event)),
-      helper.addEventListener(this._browserSession, 'Playwright.downloadCreated', this._onDownloadCreated.bind(this)),
-      helper.addEventListener(this._browserSession, 'Playwright.downloadFilenameSuggested', this._onDownloadFilenameSuggested.bind(this)),
-      helper.addEventListener(this._browserSession, 'Playwright.downloadFinished', this._onDownloadFinished.bind(this)),
-      helper.addEventListener(this._browserSession, 'Playwright.screencastFinished', this._onScreencastFinished.bind(this)),
-      helper.addEventListener(this._browserSession, kPageProxyMessageReceived, this._onPageProxyMessageReceived.bind(this)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.pageProxyCreated', this._onPageProxyCreated.bind(this)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.pageProxyDestroyed', this._onPageProxyDestroyed.bind(this)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.provisionalLoadFailed', event => this._onProvisionalLoadFailed(event)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.windowOpen', event => this._onWindowOpen(event)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.downloadCreated', this._onDownloadCreated.bind(this)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.downloadFilenameSuggested', this._onDownloadFilenameSuggested.bind(this)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.downloadFinished', this._onDownloadFinished.bind(this)),
+      eventsHelper.addEventListener(this._browserSession, 'Playwright.screencastFinished', this._onScreencastFinished.bind(this)),
+      eventsHelper.addEventListener(this._browserSession, kPageProxyMessageReceived, this._onPageProxyMessageReceived.bind(this)),
     ];
   }
 
   _onDisconnect() {
     for (const wkPage of this._wkPages.values())
       wkPage.dispose(true);
+    for (const video of this._idToVideo.values())
+      video.artifact.reportFinished(kBrowserClosedError);
+    this._idToVideo.clear();
     this._didClose();
   }
 
@@ -95,6 +99,10 @@ export class WKBrowser extends Browser {
 
   version(): string {
     return BROWSER_VERSION;
+  }
+
+  userAgent(): string {
+    return DEFAULT_USER_AGENT;
   }
 
   _onDownloadCreated(payload: Protocol.Playwright.downloadCreatedPayload) {
@@ -149,7 +157,7 @@ export class WKBrowser extends Browser {
       context = this._defaultContext as WKBrowserContext;
     if (!context)
       return;
-    const pageProxySession = new WKSession(this._connection, pageProxyId, `The page has been closed.`, (message: any) => {
+    const pageProxySession = new WKSession(this._connection, pageProxyId, `Target closed`, (message: any) => {
       this._connection.rawSend({ ...message, pageProxyId });
     });
     const opener = event.openerId ? this._wkPages.get(event.openerId) : undefined;
@@ -194,28 +202,24 @@ export class WKBrowser extends Browser {
 }
 
 export class WKBrowserContext extends BrowserContext {
-  readonly _browser: WKBrowser;
-  readonly _browserContextId: string | undefined;
+  declare readonly _browser: WKBrowser;
   readonly _evaluateOnNewDocumentSources: string[];
 
   constructor(browser: WKBrowser, browserContextId: string | undefined, options: types.BrowserContextOptions) {
     super(browser, options, browserContextId);
-    this._browser = browser;
     this._evaluateOnNewDocumentSources = [];
     this._authenticateProxyViaHeader();
   }
 
-  async _initialize() {
+  override async _initialize() {
     assert(!this._wkPages().length);
     const browserContextId = this._browserContextId;
     const promises: Promise<any>[] = [ super._initialize() ];
-    if (this._browser.options.downloadsPath) {
-      promises.push(this._browser._browserSession.send('Playwright.setDownloadBehavior', {
-        behavior: this._options.acceptDownloads ? 'allow' : 'deny',
-        downloadPath: this._browser.options.downloadsPath,
-        browserContextId
-      }));
-    }
+    promises.push(this._browser._browserSession.send('Playwright.setDownloadBehavior', {
+      behavior: this._options.acceptDownloads ? 'allow' : 'deny',
+      downloadPath: this._browser.options.downloadsPath,
+      browserContextId
+    }));
     if (this._options.ignoreHTTPSErrors)
       promises.push(this._browser._browserSession.send('Playwright.setIgnoreCertificateErrors', { browserContextId, ignore: true }));
     if (this._options.locale)
@@ -317,9 +321,15 @@ export class WKBrowserContext extends BrowserContext {
       await (page._delegate as WKPage).updateRequestInterception();
   }
 
+  _onClosePersistent() {}
+
   async _doClose() {
     assert(this._browserContextId);
     await this._browser._browserSession.send('Playwright.deleteContext', { browserContextId: this._browserContextId });
     this._browser._contexts.delete(this._browserContextId);
+  }
+
+  async _doCancelDownload(uuid: string) {
+    await this._browser._browserSession.send('Playwright.cancelDownload', { uuid });
   }
 }

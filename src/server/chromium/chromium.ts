@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { CRBrowser } from './crBrowser';
-import { Env } from '../processLauncher';
+import { Env, gracefullyCloseSet } from '../../utils/processLauncher';
 import { kBrowserCloseMessageId } from './crConnection';
 import { rewriteErrorMessage } from '../../utils/stackTrace';
 import { BrowserType } from '../browserType';
@@ -25,14 +27,17 @@ import { ConnectionTransport, ProtocolRequest, WebSocketTransport } from '../tra
 import { CRDevTools } from './crDevTools';
 import { BrowserOptions, BrowserProcess, PlaywrightOptions } from '../browser';
 import * as types from '../types';
-import { isDebugMode } from '../../utils/utils';
+import { debugMode, fetchData, headersArrayToObject, removeFolders, streamToString } from '../../utils/utils';
 import { RecentLogsCollector } from '../../utils/debugLogger';
-import { ProgressController } from '../progress';
+import { Progress, ProgressController } from '../progress';
 import { TimeoutSettings } from '../../utils/timeoutSettings';
 import { helper } from '../helper';
 import { CallMetadata } from '../instrumentation';
-import { findChromiumChannel } from './findChromiumChannel';
 import http from 'http';
+import https from 'https';
+import { registry } from '../../utils/registry';
+
+const ARTIFACTS_FOLDER = path.join(os.tmpdir(), 'playwright-artifacts-');
 
 export class Chromium extends BrowserType {
   private _devtools: CRDevTools | undefined;
@@ -40,46 +45,56 @@ export class Chromium extends BrowserType {
   constructor(playwrightOptions: PlaywrightOptions) {
     super('chromium', playwrightOptions);
 
-    if (isDebugMode())
+    if (debugMode())
       this._devtools = this._createDevTools();
   }
 
-  executablePath(options?: types.LaunchOptions): string {
-    if (options?.channel)
-      return findChromiumChannel(options.channel);
-    return super.executablePath(options);
-  }
-
-  async connectOverCDP(metadata: CallMetadata, endpointURL: string, options: { slowMo?: number, sdkLanguage: string }, timeout?: number) {
+  override async connectOverCDP(metadata: CallMetadata, endpointURL: string, options: { slowMo?: number, headers?: types.HeadersArray }, timeout?: number) {
     const controller = new ProgressController(metadata, this);
     controller.setLogName('browser');
-    const browserLogsCollector = new RecentLogsCollector();
     return controller.run(async progress => {
-      const chromeTransport = await WebSocketTransport.connect(progress, await urlToWSEndpoint(endpointURL));
-      const browserProcess: BrowserProcess = {
-        close: async () => {
-          await chromeTransport.closeAndWait();
-        },
-        kill: async () => {
-          await chromeTransport.closeAndWait();
-        }
-      };
-      const browserOptions: BrowserOptions = {
-        ...this._playwrightOptions,
-        slowMo: options.slowMo,
-        name: 'chromium',
-        isChromium: true,
-        persistent: { sdkLanguage: options.sdkLanguage, noDefaultViewport: true },
-        browserProcess,
-        protocolLogger: helper.debugProtocolLogger(),
-        browserLogsCollector,
-      };
-      return await CRBrowser.connect(chromeTransport, browserOptions);
-    }, TimeoutSettings.timeout({timeout}));
+      return await this._connectOverCDPInternal(progress, endpointURL, options);
+    }, TimeoutSettings.timeout({ timeout }));
+  }
+
+  async _connectOverCDPInternal(progress: Progress, endpointURL: string, options: { slowMo?: number, headers?: types.HeadersArray }, onClose?: () => Promise<void>) {
+    let headersMap: { [key: string]: string; } | undefined;
+    if (options.headers)
+      headersMap = headersArrayToObject(options.headers, false);
+
+    const artifactsDir = await fs.promises.mkdtemp(ARTIFACTS_FOLDER);
+
+    const wsEndpoint = await urlToWSEndpoint(endpointURL);
+    progress.throwIfAborted();
+
+    const chromeTransport = await WebSocketTransport.connect(progress, wsEndpoint, headersMap);
+    const doClose = async () => {
+      await removeFolders([ artifactsDir ]);
+      await chromeTransport.closeAndWait();
+      await onClose?.();
+    };
+    const browserProcess: BrowserProcess = { close: doClose, kill: doClose };
+    const browserOptions: BrowserOptions = {
+      ...this._playwrightOptions,
+      slowMo: options.slowMo,
+      name: 'chromium',
+      isChromium: true,
+      persistent: { noDefaultViewport: true },
+      browserProcess,
+      protocolLogger: helper.debugProtocolLogger(),
+      browserLogsCollector: new RecentLogsCollector(),
+      artifactsDir,
+      downloadsPath: artifactsDir,
+      tracesDir: artifactsDir
+    };
+    progress.throwIfAborted();
+    return await CRBrowser.connect(chromeTransport, browserOptions);
   }
 
   private _createDevTools() {
-    return new CRDevTools(path.join(this._registry.browserDirectory('chromium'), 'devtools-preferences.json'));
+    // TODO: this is totally wrong when using channels.
+    const directory = registry.findExecutable('chromium').directory;
+    return directory ? new CRDevTools(path.join(directory, 'devtools-preferences.json')) : undefined;
   }
 
   async _connectToTransport(transport: ConnectionTransport, options: BrowserOptions): Promise<CRBrowser> {
@@ -116,7 +131,79 @@ export class Chromium extends BrowserType {
     transport.send(message);
   }
 
+  override async _launchWithSeleniumHub(progress: Progress, hubUrl: string, options: types.LaunchOptions): Promise<CRBrowser> {
+    if (!hubUrl.endsWith('/'))
+      hubUrl = hubUrl + '/';
+
+    const args = this._innerDefaultArgs(options);
+    args.push('--remote-debugging-port=0');
+    const desiredCapabilities = { 'browserName': 'chrome', 'goog:chromeOptions': { args } };
+
+    progress.log(`<connecting to selenium> ${hubUrl}`);
+    const response = await fetchData({
+      url: hubUrl + 'session',
+      method: 'POST',
+      data: JSON.stringify({
+        desiredCapabilities,
+        capabilities: { alwaysMatch: desiredCapabilities }
+      }),
+      timeout: progress.timeUntilDeadline(),
+    }, async response => {
+      const body = await streamToString(response);
+      let message = '';
+      try {
+        const json = JSON.parse(body);
+        message = json.value.localizedMessage || json.value.message;
+      } catch (e) {
+      }
+      return new Error(`Error connecting to Selenium at ${hubUrl}: ${message}`);
+    });
+    const value = JSON.parse(response).value;
+    const sessionId = value.sessionId;
+    progress.log(`<connected to selenium> sessionId=${sessionId}`);
+
+    const disconnectFromSelenium = async () => {
+      progress.log(`<disconnecting from selenium> sessionId=${sessionId}`);
+      await fetchData({
+        url: hubUrl + 'session/' + sessionId,
+        method: 'DELETE',
+      }).catch(error => progress.log(`<error disconnecting from selenium>: ${error}`));
+      progress.log(`<disconnected from selenium> sessionId=${sessionId}`);
+      gracefullyCloseSet.delete(disconnectFromSelenium);
+    };
+    gracefullyCloseSet.add(disconnectFromSelenium);
+
+    try {
+      const capabilities = value.capabilities;
+      const maybeChromeOptions = capabilities['goog:chromeOptions'];
+      const chromeOptions = maybeChromeOptions && typeof maybeChromeOptions === 'object' ? maybeChromeOptions : undefined;
+      const debuggerAddress = chromeOptions && typeof chromeOptions.debuggerAddress === 'string' ? chromeOptions.debuggerAddress : undefined;
+      const chromeOptionsURL = typeof maybeChromeOptions === 'string' ? maybeChromeOptions : undefined;
+      let endpointURL = capabilities['se:cdp'] || debuggerAddress || chromeOptionsURL;
+      if (!['ws://', 'wss://', 'http://', 'https://'].some(protocol => endpointURL.startsWith(protocol)))
+        endpointURL = 'http://' + endpointURL;
+      return this._connectOverCDPInternal(progress, endpointURL, { slowMo: options.slowMo }, disconnectFromSelenium);
+    } catch (e) {
+      await disconnectFromSelenium();
+      throw e;
+    }
+  }
+
   _defaultArgs(options: types.LaunchOptions, isPersistent: boolean, userDataDir: string): string[] {
+    const chromeArguments = this._innerDefaultArgs(options);
+    chromeArguments.push(`--user-data-dir=${userDataDir}`);
+    if (options.useWebSocket)
+      chromeArguments.push('--remote-debugging-port=0');
+    else
+      chromeArguments.push('--remote-debugging-pipe');
+    if (isPersistent)
+      chromeArguments.push('about:blank');
+    else
+      chromeArguments.push('--no-startup-window');
+    return chromeArguments;
+  }
+
+  private _innerDefaultArgs(options: types.LaunchOptions): string[] {
     const { args = [], proxy } = options;
     const userDataDirArg = args.find(arg => arg.startsWith('--user-data-dir'));
     if (userDataDirArg)
@@ -126,11 +213,11 @@ export class Chromium extends BrowserType {
     if (args.find(arg => !arg.startsWith('-')))
       throw new Error('Arguments can not specify page to be opened');
     const chromeArguments = [...DEFAULT_ARGS];
-    chromeArguments.push(`--user-data-dir=${userDataDir}`);
-    if (options.useWebSocket)
-      chromeArguments.push('--remote-debugging-port=0');
-    else
-      chromeArguments.push('--remote-debugging-pipe');
+
+    // See https://github.com/microsoft/playwright/issues/7362
+    if (os.platform() === 'darwin')
+      chromeArguments.push('--enable-use-zoom-for-dsf=false');
+
     if (options.devtools)
       chromeArguments.push('--auto-open-devtools-for-tabs');
     if (options.headless) {
@@ -147,21 +234,21 @@ export class Chromium extends BrowserType {
       const proxyURL = new URL(proxy.server);
       const isSocks = proxyURL.protocol === 'socks5:';
       // https://www.chromium.org/developers/design-documents/network-settings
-      if (isSocks) {
+      if (isSocks && !this._playwrightOptions.socksProxyPort) {
         // https://www.chromium.org/developers/design-documents/network-stack/socks-proxy
         chromeArguments.push(`--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE ${proxyURL.hostname}"`);
       }
       chromeArguments.push(`--proxy-server=${proxy.server}`);
-      if (proxy.bypass) {
-        const patterns = proxy.bypass.split(',').map(t => t.trim()).map(t => t.startsWith('.') ? '*' + t : t);
-        chromeArguments.push(`--proxy-bypass-list=${patterns.join(';')}`);
-      }
+      const proxyBypassRules = [];
+      // https://source.chromium.org/chromium/chromium/src/+/master:net/docs/proxy.md;l=548;drc=71698e610121078e0d1a811054dcf9fd89b49578
+      if (this._playwrightOptions.socksProxyPort)
+        proxyBypassRules.push('<-loopback>');
+      if (proxy.bypass)
+        proxyBypassRules.push(...proxy.bypass.split(',').map(t => t.trim()).map(t => t.startsWith('.') ? '*' + t : t));
+      if (proxyBypassRules.length > 0)
+        chromeArguments.push(`--proxy-bypass-list=${proxyBypassRules.join(';')}`);
     }
     chromeArguments.push(...args);
-    if (isPersistent)
-      chromeArguments.push('about:blank');
-    else
-      chromeArguments.push('--no-startup-window');
     return chromeArguments;
   }
 }
@@ -177,8 +264,7 @@ const DEFAULT_ARGS = [
   '--disable-default-apps',
   '--disable-dev-shm-usage',
   '--disable-extensions',
-  // BlinkGenPropertyTrees disabled due to crbug.com/937609
-  '--disable-features=TranslateUI,BlinkGenPropertyTrees,ImprovedCookieControls,SameSiteByDefaultCookies,LazyFrameLoading',
+  '--disable-features=ImprovedCookieControls,LazyFrameLoading,GlobalMediaControls,DestroyProfileOnBrowserClose,MediaRouter',
   '--allow-pre-commit-input',
   '--disable-hang-monitor',
   '--disable-ipc-flooding-protection',
@@ -192,14 +278,21 @@ const DEFAULT_ARGS = [
   '--enable-automation',
   '--password-store=basic',
   '--use-mock-keychain',
+  // See https://chromium-review.googlesource.com/c/chromium/src/+/2436773
+  '--no-service-autorun',
 ];
 
 async function urlToWSEndpoint(endpointURL: string) {
   if (endpointURL.startsWith('ws'))
     return endpointURL;
   const httpURL = endpointURL.endsWith('/') ? `${endpointURL}json/version/` : `${endpointURL}/json/version/`;
+  const request = endpointURL.startsWith('https') ? https : http;
   const json = await new Promise<string>((resolve, reject) => {
-    http.get(httpURL, resp => {
+    request.get(httpURL, resp => {
+      if (resp.statusCode! < 200 || resp.statusCode! >= 400) {
+        reject(new Error(`Unexpected status ${resp.statusCode} when connecting to ${httpURL}.\n` +
+        `This does not look like a DevTools server, try connecting via ws://.`));
+      }
       let data = '';
       resp.on('data', chunk => data += chunk);
       resp.on('end', () => resolve(data));

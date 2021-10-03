@@ -18,11 +18,11 @@
 
 /* eslint-disable no-console */
 
-import path from 'path';
-import program from 'commander';
-import os from 'os';
 import fs from 'fs';
-import { runServer, printApiJson, launchBrowserServer, installBrowsers } from './driver';
+import os from 'os';
+import path from 'path';
+import { program, Command } from 'commander';
+import { runDriver, runServer, printApiJson, launchBrowserServer } from './driver';
 import { showTraceViewer } from '../server/trace/viewer/traceViewer';
 import * as playwright from '../..';
 import { BrowserContext } from '../client/browserContext';
@@ -31,88 +31,125 @@ import { Page } from '../client/page';
 import { BrowserType } from '../client/browserType';
 import { BrowserContextOptions, LaunchOptions } from '../client/types';
 import { spawn } from 'child_process';
-import { installDeps } from '../install/installDeps';
-import { allBrowserNames } from '../utils/registry';
+import { registry, Executable } from '../utils/registry';
+import { launchGridAgent } from '../grid/gridAgent';
+import { launchGridServer } from '../grid/gridServer';
+
+const packageJSON = require('../../package.json');
 
 program
-    .version('Version ' + require('../../package.json').version)
-    .name('npx playwright');
+    .version('Version ' + packageJSON.version)
+    .name(process.env.PW_CLI_NAME || 'npx playwright');
 
 commandWithOpenOptions('open [url]', 'open page in browser specified via -b, --browser', [])
-    .action(function(url, command) {
-      open(command, url, language()).catch(logErrorAndExit);
+    .action(function(url, options) {
+      open(options, url, language()).catch(logErrorAndExit);
     })
-    .on('--help', function() {
-      console.log('');
-      console.log('Examples:');
-      console.log('');
-      console.log('  $ open');
-      console.log('  $ open -b webkit https://example.com');
-    });
+    .addHelpText('afterAll', `
+Examples:
+
+  $ open  $ open -b webkit https://example.com`);
 
 commandWithOpenOptions('codegen [url]', 'open page and generate code for user actions',
     [
       ['-o, --output <file name>', 'saves the generated script to a file'],
-      ['--target <language>', `language to use, one of javascript, python, python-async, csharp`, language()],
-    ]).action(function(url, command) {
-  codegen(command, url, command.target, command.output).catch(logErrorAndExit);
-}).on('--help', function() {
-  console.log('');
-  console.log('Examples:');
-  console.log('');
-  console.log('  $ codegen');
-  console.log('  $ codegen --target=python');
-  console.log('  $ codegen -b webkit https://example.com');
-});
+      ['--target <language>', `language to generate, one of javascript, test, python, python-async, csharp`, language()],
+    ]).action(function(url, options) {
+  codegen(options, url, options.target, options.output).catch(logErrorAndExit);
+}).addHelpText('afterAll', `
+Examples:
+
+  $ codegen
+  $ codegen --target=python
+  $ codegen -b webkit https://example.com`);
 
 program
-    .command('debug <app> [args...]')
+    .command('debug <app> [args...]', { hidden: true })
     .description('run command in debug mode: disable timeout, open inspector')
-    .action(function(app, args) {
-      spawn(app, args, {
+    .allowUnknownOption(true)
+    .action(function(app, options) {
+      spawn(app, options, {
         env: { ...process.env, PWDEBUG: '1' },
         stdio: 'inherit'
       });
-    }).on('--help', function() {
-      console.log('');
-      console.log('Examples:');
-      console.log('');
-      console.log('  $ debug node test.js');
-      console.log('  $ debug npm run test');
-    });
+    }).addHelpText('afterAll', `
+Examples:
+
+  $ debug node test.js
+  $ debug npm run test`);
+
+function suggestedBrowsersToInstall() {
+  return registry.executables().filter(e => e.installType !== 'none' && e.type !== 'tool').map(e => e.name).join(', ');
+}
+
+function checkBrowsersToInstall(args: string[]): Executable[] {
+  const faultyArguments: string[] = [];
+  const executables: Executable[] = [];
+  for (const arg of args) {
+    const executable = registry.findExecutable(arg);
+    if (!executable || executable.installType === 'none')
+      faultyArguments.push(arg);
+    else
+      executables.push(executable);
+  }
+  if (faultyArguments.length) {
+    console.log(`Invalid installation targets: ${faultyArguments.map(name => `'${name}'`).join(', ')}. Expecting one of: ${suggestedBrowsersToInstall()}`);
+    process.exit(1);
+  }
+  return executables;
+}
 
 program
-    .command('install [browserType...]')
+    .command('install [browser...]')
     .description('ensure browsers necessary for this version of Playwright are installed')
-    .action(async function(browserType) {
+    .option('--with-deps', 'install system dependencies for browsers')
+    .action(async function(args: string[], options: { withDeps?: boolean }) {
       try {
-        const allBrowsers = new Set(allBrowserNames);
-        for (const type of browserType) {
-          if (!allBrowsers.has(type)) {
-            console.log(`Invalid browser name: '${type}'. Expecting one of: ${allBrowserNames.map(name => `'${name}'`).join(', ')}`);
-            process.exit(1);
-          }
+        if (!args.length) {
+          const executables = registry.defaultExecutables();
+          if (options.withDeps)
+            await registry.installDeps(executables);
+          await registry.install(executables);
+        } else {
+          const executables = checkBrowsersToInstall(args);
+          if (options.withDeps)
+            await registry.installDeps(executables);
+          await registry.install(executables);
         }
-        if (browserType.length && browserType.includes('chromium'))
-          browserType = browserType.concat('ffmpeg');
-        await installBrowsers(browserType.length ? browserType : undefined);
       } catch (e) {
         console.log(`Failed to install browsers\n${e}`);
         process.exit(1);
       }
-    });
+    }).addHelpText('afterAll', `
+
+Examples:
+  - $ install
+    Install default browsers.
+
+  - $ install chrome firefox
+    Install custom browsers, supports ${suggestedBrowsersToInstall()}.`);
+
 
 program
-    .command('install-deps [browserType...]')
+    .command('install-deps [browser...]')
     .description('install dependencies necessary to run browsers (will ask for sudo permissions)')
-    .action(async function(browserType) {
+    .action(async function(args: string[]) {
       try {
-        await installDeps(browserType);
+        if (!args.length)
+          await registry.installDeps(registry.defaultExecutables());
+        else
+          await registry.installDeps(checkBrowsersToInstall(args));
       } catch (e) {
         console.log(`Failed to install browser dependencies\n${e}`);
         process.exit(1);
       }
-    });
+    }).addHelpText('afterAll', `
+Examples:
+  - $ install-deps
+    Install dependencies for default browsers.
+
+  - $ install-deps chrome firefox
+    Install dependencies for specific browsers, supports ${suggestedBrowsersToInstall()}.`);
 
 const browsers = [
   { alias: 'cr', name: 'Chromium', type: 'chromium' },
@@ -120,16 +157,14 @@ const browsers = [
   { alias: 'wk', name: 'WebKit', type: 'webkit' },
 ];
 
-for (const {alias, name, type} of browsers) {
+for (const { alias, name, type } of browsers) {
   commandWithOpenOptions(`${alias} [url]`, `open page in ${name}`, [])
-      .action(function(url, command) {
-        open({ ...command, browser: type }, url, command.target).catch(logErrorAndExit);
-      }).on('--help', function() {
-        console.log('');
-        console.log('Examples:');
-        console.log('');
-        console.log(`  $ ${alias} https://example.com`);
-      });
+      .action(function(url, options) {
+        open({ ...options, browser: type }, url, options.target).catch(logErrorAndExit);
+      }).addHelpText('afterAll', `
+Examples:
+
+  $ ${alias} https://example.com`);
 }
 
 commandWithOpenOptions('screenshot <url> <filename>', 'capture a page screenshot',
@@ -139,44 +174,87 @@ commandWithOpenOptions('screenshot <url> <filename>', 'capture a page screenshot
       ['--full-page', 'whether to take a full page screenshot (entire scrollable area)'],
     ]).action(function(url, filename, command) {
   screenshot(command, command, url, filename).catch(logErrorAndExit);
-}).on('--help', function() {
-  console.log('');
-  console.log('Examples:');
-  console.log('');
-  console.log('  $ screenshot -b webkit https://example.com example.png');
-});
+}).addHelpText('afterAll', `
+Examples:
+
+  $ screenshot -b webkit https://example.com example.png`);
 
 commandWithOpenOptions('pdf <url> <filename>', 'save page as pdf',
     [
       ['--wait-for-selector <selector>', 'wait for given selector before saving as pdf'],
       ['--wait-for-timeout <timeout>', 'wait for given timeout in milliseconds before saving as pdf'],
-    ]).action(function(url, filename, command) {
-  pdf(command, command, url, filename).catch(logErrorAndExit);
-}).on('--help', function() {
-  console.log('');
-  console.log('Examples:');
-  console.log('');
-  console.log('  $ pdf https://example.com example.pdf');
-});
+    ]).action(function(url, filename, options) {
+  pdf(options, options, url, filename).catch(logErrorAndExit);
+}).addHelpText('afterAll', `
+Examples:
 
-if (process.env.PWTRACE) {
-  program
-      .command('show-trace [trace]')
-      .option('--resources <dir>', 'load resources from shared folder')
-      .description('Show trace viewer')
-      .action(function(trace, command) {
-        showTraceViewer(trace, command.resources).catch(logErrorAndExit);
-      }).on('--help', function() {
-        console.log('');
-        console.log('Examples:');
-        console.log('');
-        console.log('  $ show-trace --resources=resources trace/file.trace');
-        console.log('  $ show-trace trace/directory');
+  $ pdf https://example.com example.pdf`);
+
+program
+    .command('experimental-grid-server', { hidden: true })
+    .option('--port <port>', 'grid port; defaults to 3333')
+    .option('--agent-factory <factory>', 'path to grid agent factory or npm package')
+    .option('--auth-token <authToken>', 'optional authentication token')
+    .action(function(options) {
+      launchGridServer(options.agentFactory, options.port || 3333, options.authToken);
+    });
+
+program
+    .command('experimental-grid-agent', { hidden: true })
+    .requiredOption('--agent-id <agentId>', 'agent ID')
+    .requiredOption('--grid-url <gridURL>', 'grid URL')
+    .action(function(options) {
+      launchGridAgent(options.agentId, options.gridUrl);
+    });
+
+program
+    .command('show-trace [trace]')
+    .option('-b, --browser <browserType>', 'browser to use, one of cr, chromium, ff, firefox, wk, webkit', 'chromium')
+    .description('Show trace viewer')
+    .action(function(trace, options) {
+      if (options.browser === 'cr')
+        options.browser = 'chromium';
+      if (options.browser === 'ff')
+        options.browser = 'firefox';
+      if (options.browser === 'wk')
+        options.browser = 'webkit';
+      showTraceViewer(trace, options.browser).catch(logErrorAndExit);
+    }).addHelpText('afterAll', `
+Examples:
+
+  $ show-trace trace/directory
+  $ show-trace https://example.com/trace.zip`);
+
+if (!process.env.PW_CLI_TARGET_LANG) {
+  let playwrightTestPackagePath = null;
+  try {
+    const isLocal = packageJSON.name === '@playwright/test' || process.env.PWTEST_CLI_ALLOW_TEST_COMMAND;
+    if (isLocal) {
+      playwrightTestPackagePath = '../test/cli';
+    } else {
+      playwrightTestPackagePath = require.resolve('@playwright/test/lib/test/cli', {
+        paths: [__dirname, process.cwd()]
       });
+    }
+  } catch {}
+
+  if (playwrightTestPackagePath) {
+    require(playwrightTestPackagePath).addTestCommand(program);
+  } else {
+    const command = program.command('test').allowUnknownOption(true);
+    command.description('Run tests with Playwright Test. Available in @playwright/test package.');
+    command.action(async () => {
+      console.error('Please install @playwright/test package to use Playwright Test.');
+      console.error('  npm install -D @playwright/test');
+      process.exit(1);
+    });
+  }
 }
 
 if (process.argv[2] === 'run-driver')
-  runServer();
+  runDriver();
+else if (process.argv[2] === 'run-server')
+  runServer(process.argv[3] ? +process.argv[3] : undefined).catch(logErrorAndExit);
 else if (process.argv[2] === 'print-api-json')
   printApiJson();
 else if (process.argv[2] === 'launch-server')
@@ -191,10 +269,12 @@ type Options = {
   colorScheme?: string;
   device?: string;
   geolocation?: string;
+  ignoreHttpsErrors?: boolean;
   lang?: string;
   loadStorage?: string;
   proxyServer?: string;
   saveStorage?: string;
+  saveTrace?: string;
   timeout: string;
   timezone?: string;
   viewportSize?: string;
@@ -207,10 +287,10 @@ type CaptureOptions = {
   fullPage: boolean;
 };
 
-async function launchContext(options: Options, headless: boolean): Promise<{ browser: Browser, browserName: string, launchOptions: LaunchOptions, contextOptions: BrowserContextOptions, context: BrowserContext }> {
+async function launchContext(options: Options, headless: boolean, executablePath?: string): Promise<{ browser: Browser, browserName: string, launchOptions: LaunchOptions, contextOptions: BrowserContextOptions, context: BrowserContext }> {
   validateOptions(options);
   const browserType = lookupBrowserType(options);
-  const launchOptions: LaunchOptions = { headless };
+  const launchOptions: LaunchOptions = { headless, executablePath };
   if (options.channel)
     launchOptions.channel = options.channel as any;
 
@@ -233,8 +313,7 @@ async function launchContext(options: Options, headless: boolean): Promise<{ bro
   if (contextOptions.isMobile && browserType.name() === 'firefox')
     contextOptions.isMobile = undefined;
 
-  if (process.env.PWTRACE)
-    (contextOptions as any)._traceDir = path.join(process.cwd(), '.trace');
+  contextOptions.acceptDownloads = true;
 
   // Proxy
 
@@ -298,6 +377,9 @@ async function launchContext(options: Options, headless: boolean): Promise<{ bro
   if (options.loadStorage)
     contextOptions.storageState = options.loadStorage;
 
+  if (options.ignoreHttpsErrors)
+    contextOptions.ignoreHTTPSErrors = true;
+
   // Close app when the last window closes.
 
   const context = await browser.newContext(contextOptions);
@@ -309,6 +391,8 @@ async function launchContext(options: Options, headless: boolean): Promise<{ bro
     if (closingBrowser)
       return;
     closingBrowser = true;
+    if (options.saveTrace)
+      await context.tracing.stop({ path: options.saveTrace });
     if (options.saveStorage)
       await context.storageState({ path: options.saveStorage }).catch(e => null);
     await browser.close();
@@ -329,9 +413,14 @@ async function launchContext(options: Options, headless: boolean): Promise<{ bro
     context.setDefaultNavigationTimeout(parseInt(options.timeout, 10));
   }
 
+  if (options.saveTrace)
+    await context.tracing.start({ screenshots: true, snapshots: true });
+
   // Omit options that we add automatically for presentation purpose.
   delete launchOptions.headless;
+  delete launchOptions.executablePath;
   delete contextOptions.deviceScaleFactor;
+  delete contextOptions.acceptDownloads;
   return { browser, browserName: browserType.name(), context, contextOptions, launchOptions };
 }
 
@@ -340,7 +429,7 @@ async function openPage(context: BrowserContext, url: string | undefined): Promi
   if (url) {
     if (fs.existsSync(url))
       url = 'file://' + path.resolve(url);
-    else if (!url.startsWith('http') && !url.startsWith('file://') && !url.startsWith('about:'))
+    else if (!url.startsWith('http') && !url.startsWith('file://') && !url.startsWith('about:') && !url.startsWith('data:'))
       url = 'http://' + url;
     await page.goto(url);
   }
@@ -348,7 +437,7 @@ async function openPage(context: BrowserContext, url: string | undefined): Promi
 }
 
 async function open(options: Options, url: string | undefined, language: string) {
-  const { context, launchOptions, contextOptions } = await launchContext(options, !!process.env.PWTEST_CLI_HEADLESS);
+  const { context, launchOptions, contextOptions } = await launchContext(options, !!process.env.PWTEST_CLI_HEADLESS, process.env.PWTEST_CLI_EXECUTABLE_PATH);
   await context._enableRecorder({
     language,
     launchOptions,
@@ -362,9 +451,7 @@ async function open(options: Options, url: string | undefined, language: string)
 }
 
 async function codegen(options: Options, url: string | undefined, language: string, outputFile?: string) {
-  const { context, launchOptions, contextOptions } = await launchContext(options, !!process.env.PWTEST_CLI_HEADLESS);
-  if (process.env.PWTRACE)
-    contextOptions._traceDir = path.join(process.cwd(), '.trace');
+  const { context, launchOptions, contextOptions } = await launchContext(options, !!process.env.PWTEST_CLI_HEADLESS, process.env.PWTEST_CLI_EXECUTABLE_PATH);
   await context._enableRecorder({
     language,
     launchOptions,
@@ -453,10 +540,10 @@ function logErrorAndExit(e: Error) {
 }
 
 function language(): string {
-  return process.env.PW_CLI_TARGET_LANG || 'javascript';
+  return process.env.PW_CLI_TARGET_LANG || 'test';
 }
 
-function commandWithOpenOptions(command: string, description: string, options: any[][]): program.Command {
+function commandWithOpenOptions(command: string, description: string, options: any[][]): Command {
   let result = program.command(command).description(description);
   for (const option of options)
     result = result.option(option[0], ...option.slice(1));
@@ -466,10 +553,12 @@ function commandWithOpenOptions(command: string, description: string, options: a
       .option('--color-scheme <scheme>', 'emulate preferred color scheme, "light" or "dark"')
       .option('--device <deviceName>', 'emulate device, for example  "iPhone 11"')
       .option('--geolocation <coordinates>', 'specify geolocation coordinates, for example "37.819722,-122.478611"')
+      .option('--ignore-https-errors', 'ignore https errors')
       .option('--load-storage <filename>', 'load context storage state from the file, previously saved with --save-storage')
       .option('--lang <language>', 'specify language / locale, for example "en-GB"')
       .option('--proxy-server <proxy>', 'specify proxy server, for example "http://myproxy:3128" or "socks5://myproxy:8080"')
       .option('--save-storage <filename>', 'save context storage state at the end, for later use with --load-storage')
+      .option('--save-trace <filename>', 'record a trace for the session and save it to a file')
       .option('--timezone <time zone>', 'time zone to emulate, for example "Europe/Rome"')
       .option('--timeout <timeout>', 'timeout for Playwright actions in milliseconds', '10000')
       .option('--user-agent <ua string>', 'specify user agent string')

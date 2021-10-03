@@ -16,7 +16,7 @@
 
 import { Browser } from './browser';
 import { BrowserContext } from './browserContext';
-import { BrowserType, RemoteBrowser } from './browserType';
+import { BrowserType } from './browserType';
 import { ChannelOwner } from './channelOwner';
 import { ElementHandle } from './elementHandle';
 import { Frame } from './frame';
@@ -34,53 +34,68 @@ import * as channels from '../protocol/channels';
 import { Stream } from './stream';
 import { debugLogger } from '../utils/debugLogger';
 import { SelectorsOwner } from './selectors';
-import { isUnderTest } from '../utils/utils';
 import { Android, AndroidSocket, AndroidDevice } from './android';
-import { captureStackTrace } from '../utils/stackTrace';
+import { ParsedStackTrace } from '../utils/stackTrace';
 import { Artifact } from './artifact';
+import { EventEmitter } from 'events';
+import { JsonPipe } from './jsonPipe';
+import { FetchRequest } from './fetch';
 
-class Root extends ChannelOwner<channels.Channel, {}> {
+class Root extends ChannelOwner<channels.RootChannel, {}> {
   constructor(connection: Connection) {
-    super(connection, '', '', {});
+    super(connection, 'Root', '', {});
+  }
+
+  async initialize(): Promise<Playwright> {
+    return Playwright.from((await this._channel.initialize({
+      sdkLanguage: 'javascript',
+    })).playwright);
   }
 }
 
-export class Connection {
+export class Connection extends EventEmitter {
   readonly _objects = new Map<string, ChannelOwner>();
   private _waitingForObject = new Map<string, any>();
   onmessage = (message: object): void => {};
   private _lastId = 0;
-  private _callbacks = new Map<number, { resolve: (a: any) => void, reject: (a: Error) => void }>();
-  private _rootObject: ChannelOwner;
+  private _callbacks = new Map<number, { resolve: (a: any) => void, reject: (a: Error) => void, stackTrace: ParsedStackTrace }>();
+  private _rootObject: Root;
+  private _disconnectedErrorMessage: string | undefined;
+  private _onClose?: () => void;
 
-  constructor() {
+  constructor(onClose?: () => void) {
+    super();
     this._rootObject = new Root(this);
+    this._onClose = onClose;
   }
 
-  async waitForObjectWithKnownName(guid: string): Promise<any> {
-    if (this._objects.has(guid))
-      return this._objects.get(guid)!;
-    return new Promise(f => this._waitingForObject.set(guid, f));
+  async initializePlaywright(): Promise<Playwright> {
+    return await this._rootObject.initialize();
+  }
+
+  pendingProtocolCalls(): ParsedStackTrace[] {
+    return Array.from(this._callbacks.values()).map(callback => callback.stackTrace);
   }
 
   getObjectWithKnownName(guid: string): any {
     return this._objects.get(guid)!;
   }
 
-  async sendMessageToServer(guid: string, method: string, params: any, apiName: string | undefined): Promise<any> {
-    const { stack, frames } = captureStackTrace();
+  async sendMessageToServer(object: ChannelOwner, method: string, params: any, maybeStackTrace: ParsedStackTrace | null): Promise<any> {
+    const guid = object._guid;
+    const stackTrace: ParsedStackTrace = maybeStackTrace || { frameTexts: [], frames: [], apiName: '', allFrames: [] };
+    const { frames, apiName } = stackTrace;
+
     const id = ++this._lastId;
     const converted = { id, guid, method, params };
     // Do not include metadata in debug logs to avoid noise.
     debugLogger.log('channel:command', converted);
-    this.onmessage({ ...converted, metadata: { stack: frames, apiName } });
-    try {
-      return await new Promise((resolve, reject) => this._callbacks.set(id, { resolve, reject }));
-    } catch (e) {
-      const innerStack = ((process.env.PWDEBUGIMPL || isUnderTest()) && e.stack) ? e.stack.substring(e.stack.indexOf(e.message) + e.message.length) : '';
-      e.stack = e.message + innerStack + '\n' + stack;
-      throw e;
-    }
+    const metadata: channels.Metadata = { stack: frames, apiName };
+    this.onmessage({ ...converted, metadata });
+
+    if (this._disconnectedErrorMessage)
+      throw new Error(this._disconnectedErrorMessage);
+    return await new Promise((resolve, reject) => this._callbacks.set(id, { resolve, reject, stackTrace }));
   }
 
   _debugScopeState(): any {
@@ -95,7 +110,7 @@ export class Connection {
       if (!callback)
         throw new Error(`Cannot find command to respond: ${id}`);
       this._callbacks.delete(id);
-      if (error)
+      if (error && !result)
         callback.reject(parseError(error));
       else
         callback.resolve(this._replaceGuidsWithChannels(result));
@@ -117,7 +132,24 @@ export class Connection {
     const object = this._objects.get(guid);
     if (!object)
       throw new Error(`Cannot find object to emit "${method}": ${guid}`);
-    object._channel.emit(method, this._replaceGuidsWithChannels(params));
+    object._channel.emit(method, object._type === 'JsonPipe' ? params : this._replaceGuidsWithChannels(params));
+  }
+
+  close() {
+    if (this._onClose)
+      this._onClose();
+  }
+
+  didDisconnect(errorMessage: string) {
+    this._disconnectedErrorMessage = errorMessage;
+    for (const callback of this._callbacks.values())
+      callback.reject(new Error(errorMessage));
+    this._callbacks.clear();
+    this.emit('disconnect');
+  }
+
+  isDisconnected() {
+    return !!this._disconnectedErrorMessage;
   }
 
   private _replaceGuidsWithChannels(payload: any): any {
@@ -185,20 +217,23 @@ export class Connection {
       case 'ElementHandle':
         result = new ElementHandle(parent, type, guid, initializer);
         break;
+      case 'FetchRequest':
+        result = new FetchRequest(parent, type, guid, initializer);
+        break;
       case 'Frame':
         result = new Frame(parent, type, guid, initializer);
         break;
       case 'JSHandle':
         result = new JSHandle(parent, type, guid, initializer);
         break;
+      case 'JsonPipe':
+        result = new JsonPipe(parent, type, guid, initializer);
+        break;
       case 'Page':
         result = new Page(parent, type, guid, initializer);
         break;
       case 'Playwright':
         result = new Playwright(parent, type, guid, initializer);
-        break;
-      case 'RemoteBrowser':
-        result = new RemoteBrowser(parent, type, guid, initializer);
         break;
       case 'Request':
         result = new Request(parent, type, guid, initializer);

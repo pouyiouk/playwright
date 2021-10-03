@@ -31,6 +31,7 @@
   --transparent-blue: #2196F355;
   --orange: #d24726;
   --black: #1E1E1E;
+  --light-gray: #BBBBBB;
   --gray: #888888;
   --separator: #80808059;
   --focus-ring: #0E639CCC;
@@ -98,20 +99,6 @@ svg {
   display: flex;
   flex: auto;
   position: relative;
-}
-
-::-webkit-scrollbar {
-  width: 14px;
-  height: 14px;
-}
-
-::-webkit-scrollbar-thumb {
-  border: 1px solid #ccc;
-  background-color: var(--light-background);
-}
-
-::-webkit-scrollbar-corner {
-  background-color: var(--background);
 }
 
 .code {

@@ -6,7 +6,7 @@ title: "Community Showcase"
 ## Users
 
 * [VS Code](https://github.com/microsoft/vscode): Playwright is used to run cross-browser tests on their web builds
-* [TypeScript](https://github.com/microsoft/TypeScript): Playwright is used test typescript.js across browsers
+* [TypeScript](https://github.com/microsoft/TypeScript): Playwright is used to test typescript.js across browsers
 * [Elastic APM JS agent](https://github.com/elastic/apm-agent-rum-js): Playwright is used to run benchmark tests across browsers
 * [Blockstack](https://github.com/blockstack/ux): Playwright is used to run cross-browser UI tests
 * [Instakittens React admin](https://github.com/fredericbonnet/instakittens-react-admin): Playwright is used to run end-to-end test scenarios written with Cucumber
@@ -26,9 +26,12 @@ title: "Community Showcase"
 ## Tools
 
 * [Applitools](https://applitools.com): Add AI-powered visual assertions and run your Playwright tests on all browser, device, and viewport combinations in parallel, without requiring any setup.
+* [BrowserStack](https://www.browserstack.com/docs/automate/playwright): Run cross-browser Playwright tests in parallel on the BrowserStack cloud
+* [Checkly](https://checklyhq.com): Run Playwright checks on a schedule or on demand to monitor and test your web application.
 * [CodeceptJS](https://github.com/Codeception/CodeceptJS): Write scenario-driven Playwright tests with synchronous code
 * [dom-to-playwright](https://github.com/Xiphe/dom-to-playwright) to copy a JSDOM snapshot into a Playwright page.
 * [expected-condition-playwright](https://github.com/elaichenkov/expected-condition-playwright): Supplies a set of common expected conditions that can wait for certain states and conditions
+* [expect-playwright](https://github.com/playwright-community/expect-playwright): Matcher functions to simplify expect statements for the usage with the Playwright test runner or Jest Playwright.
 * [Headless Testing](https://headlesstesting.com/support/start/playwright.html): Run Playwright tests on browsers in the cloud
 * [Lumberjack](https://github.com/JakePartusch/lumberjack): Automated accessibility scanner to run checks on your entire website
 * [mockiavelli](https://github.com/HLTech/mockiavelli) Request mocking library for Playwright to test SPA in isolation from backend APIs.
@@ -38,6 +41,7 @@ title: "Community Showcase"
 * [QA Wolf](https://github.com/qawolf/qawolf): Record and create Playwright tests and then run them in CI
 * [Root Cause OSS](https://github.com/testimio/root-cause): Capture screenshots on every step and display in a viewer with logs for easy troubleshooting.
 * [Sauce Labs](https://saucelabs.com/platform/automation-tools/playwright): Run Playwright tests in parallel in the cloud or your own docker environment.
+* [Selenium Box - Enterprise Test Grid](https://seleniumbox.com): Execute Playwright tests securely inside your firewall at scale
 * [test-real-styles](https://github.com/Xiphe/test-real-styles): Utility to test real styling of virtual DOM elements in a browser
 * [Testim Playground](https://www.testim.io/playground/): Record Playwright UI tests as code
 * [Try Playwright](https://try.playwright.tech/): Interactive playground for Playwright to run examples directly from your browser
@@ -61,6 +65,8 @@ title: "Community Showcase"
 * [playwright-jest-circus-allure](https://github.com/d-shch/playwright-jest-circus-allure): Example how to use allure-report and jest-circus with playwright
 * [Heroku Playwright Example](https://github.com/mxschmitt/heroku-playwright-example): Example using Playwright on Heroku
 * [Sauce Labs Playwright Example](https://github.com/saucelabs/saucectl-playwright-example): Example using Playwright on Sauce Labs
+* [BrowserStack Playwright Samples](https://github.com/browserstack/playwright-browserstack): Playwright sample tests to run on BrowserStack
+* [Playwright - Parallel execution on AWS Lambda](https://github.com/PauloGoncalvesBH/running-playwright-on-aws-lambda): Running hundreds of Playwright tests in a few seconds with AWS Lambda
 
 ## Guides
 

@@ -16,15 +16,15 @@
 
 import { EventEmitter } from 'events';
 import * as channels from '../protocol/channels';
-import type { Connection } from './connection';
-import type { Logger } from './types';
+import { createScheme, ValidationError, Validator } from '../protocol/validator';
 import { debugLogger } from '../utils/debugLogger';
-import { rewriteErrorMessage } from '../utils/stackTrace';
-import { createScheme, Validator, ValidationError } from '../protocol/validator';
-import { StackFrame } from '../common/types';
+import { captureStackTrace, ParsedStackTrace } from '../utils/stackTrace';
+import { isUnderTest } from '../utils/utils';
+import type { Connection } from './connection';
+import type { ClientSideInstrumentation, Logger } from './types';
 
 export abstract class ChannelOwner<T extends channels.Channel = channels.Channel, Initializer = {}> extends EventEmitter {
-  private _connection: Connection;
+  protected _connection: Connection;
   private _parent: ChannelOwner | undefined;
   private _objects = new Map<string, ChannelOwner>();
 
@@ -33,6 +33,7 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
   readonly _channel: T;
   readonly _initializer: Initializer;
   _logger: Logger | undefined;
+  _csi: ClientSideInstrumentation | undefined;
 
   constructor(parent: ChannelOwner | Connection, type: string, guid: string, initializer: Initializer) {
     super();
@@ -48,7 +49,7 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
       this._logger = this._parent._logger;
     }
 
-    this._channel = this._createChannel(new EventEmitter(), '');
+    this._channel = this._createChannel(new EventEmitter(), null);
     this._initializer = initializer;
   }
 
@@ -71,15 +72,22 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
     };
   }
 
-  _createChannel(base: Object, apiName: string): T {
+  private _createChannel(base: Object, stackTrace: ParsedStackTrace | null, csi?: ClientSideInstrumentation, callCookie?: { userObject: any }): T {
     const channel = new Proxy(base, {
       get: (obj: any, prop) => {
         if (prop === 'debugScopeState')
-          return (params: any) => this._connection.sendMessageToServer(this._guid, prop, params, apiName);
+          return (params: any) => this._connection.sendMessageToServer(this, prop, params, stackTrace);
         if (typeof prop === 'string') {
           const validator = scheme[paramsName(this._type, prop)];
-          if (validator)
-            return (params: any) => this._connection.sendMessageToServer(this._guid, prop, validator(params, ''), apiName);
+          if (validator) {
+            return (params: any) => {
+              if (callCookie && csi) {
+                callCookie.userObject = csi.onApiCallBegin(renderCallWithParams(stackTrace!.apiName, params)).userObject;
+                csi = undefined;
+              }
+              return this._connection.sendMessageToServer(this, prop, validator(params, ''), stackTrace);
+            };
+          }
         }
         return obj[prop];
       },
@@ -88,31 +96,35 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
     return channel;
   }
 
-  async _wrapApiCall<R, C extends channels.Channel>(apiName: string, func: (channel: C) => Promise<R>, logger?: Logger): Promise<R> {
+  async _wrapApiCall<R, C extends channels.Channel = T>(func: (channel: C, stackTrace: ParsedStackTrace) => Promise<R>, logger?: Logger): Promise<R> {
     logger = logger || this._logger;
+    const stackTrace = captureStackTrace();
+    const { apiName, frameTexts } = stackTrace;
+
+    let ancestorWithCSI: ChannelOwner<any> = this;
+    while (!ancestorWithCSI._csi && ancestorWithCSI._parent)
+      ancestorWithCSI = ancestorWithCSI._parent;
+
+    // Do not report nested async calls to _wrapApiCall.
+    const isNested = stackTrace.allFrames.filter(f => f.function?.includes('_wrapApiCall')).length > 1;
+    const csi = isNested ? undefined : ancestorWithCSI._csi;
+    const callCookie: { userObject: any } = { userObject: null };
+
     try {
-      logApiCall(logger, `=> ${apiName} started`);
-      const channel = this._createChannel({}, apiName);
-      const result = await func(channel as any);
-      logApiCall(logger, `<= ${apiName} succeeded`);
+      logApiCall(logger, `=> ${apiName} started`, isNested);
+      const channel = this._createChannel({}, stackTrace, csi, callCookie);
+      const result = await func(channel as any, stackTrace);
+      csi?.onApiCallEnd(callCookie);
+      logApiCall(logger, `<= ${apiName} succeeded`, isNested);
       return result;
     } catch (e) {
-      logApiCall(logger, `<= ${apiName} failed`);
-      rewriteErrorMessage(e, `${apiName}: ` + e.message);
+      const innerError = ((process.env.PWDEBUGIMPL || isUnderTest()) && e.stack) ? '\n<inner error>\n' + e.stack : '';
+      e.message = apiName + ': ' + e.message;
+      e.stack = e.message + '\n' + frameTexts.join('\n') + innerError;
+      csi?.onApiCallEnd(callCookie, e);
+      logApiCall(logger, `<= ${apiName} failed`, isNested);
       throw e;
     }
-  }
-
-  _waitForEventInfoBefore(waitId: string, name: string, stack: StackFrame[]) {
-    this._connection.sendMessageToServer(this._guid, 'waitForEventInfo', { info: { name, waitId, phase: 'before', stack } }, undefined).catch(() => {});
-  }
-
-  _waitForEventInfoAfter(waitId: string, error?: string) {
-    this._connection.sendMessageToServer(this._guid, 'waitForEventInfo', { info: { waitId, phase: 'after', error } }, undefined).catch(() => {});
-  }
-
-  _waitForEventInfoLog(waitId: string, message: string) {
-    this._connection.sendMessageToServer(this._guid, 'waitForEventInfo', { info: { waitId, phase: 'log', message } }, undefined).catch(() => {});
   }
 
   private toJSON() {
@@ -127,7 +139,9 @@ export abstract class ChannelOwner<T extends channels.Channel = channels.Channel
   }
 }
 
-function logApiCall(logger: Logger | undefined, message: string) {
+function logApiCall(logger: Logger | undefined, message: string, isNested: boolean) {
+  if (isNested)
+    return;
   if (logger && logger.isEnabled('api', 'info'))
     logger.log('api', 'info', message, [], { color: 'cyan' });
   debugLogger.log('api', message);
@@ -135,6 +149,19 @@ function logApiCall(logger: Logger | undefined, message: string) {
 
 function paramsName(type: string, method: string) {
   return type + method[0].toUpperCase() + method.substring(1) + 'Params';
+}
+
+const paramsToRender = ['url', 'selector', 'text', 'key'];
+export function renderCallWithParams(apiName: string, params: any) {
+  const paramsArray = [];
+  if (params) {
+    for (const name of paramsToRender) {
+      if (params[name])
+        paramsArray.push(params[name]);
+    }
+  }
+  const paramsText = paramsArray.length ? '(' + paramsArray.join(', ') + ')' : '';
+  return apiName + paramsText;
 }
 
 const tChannel = (name: string): Validator => {

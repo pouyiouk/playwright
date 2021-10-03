@@ -20,7 +20,10 @@ import fs from 'fs';
 const debugLoggerColorMap = {
   'api': 45, // cyan
   'protocol': 34, // green
+  'install': 34, // green
+  'download': 34, // green
   'browser': 0, // reset
+  'proxy': 92, // purple
   'error': 160, // red,
   'channel:command': 33, // blue
   'channel:response': 202, // orange
@@ -62,7 +65,7 @@ class DebugLogger {
 
 export const debugLogger = new DebugLogger();
 
-const kLogCount = 50;
+const kLogCount = 150;
 export class RecentLogsCollector {
   private _logs: string[] = [];
 

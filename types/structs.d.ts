@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-import { JSHandle, ElementHandle, Frame, Page, BrowserContext } from './types';
+import { JSHandle, ElementHandle, Frame, Page, BrowserContext, Locator } from './types';
 
 /**
  * Can be converted to JSON
  */
-export type Serializable = {};
+export type Serializable = any;
 /**
  * Can be converted to JSON, but may also contain JSHandles.
  */
